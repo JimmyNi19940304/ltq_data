@@ -1,0 +1,21 @@
+{
+  "ladder_dir": "/home/lab320/ltq-data/ladders",
+  "ladder_masses": [
+    365,
+    527,
+    689,
+    851,
+    1013,
+    1175,
+    1337,
+    1499
+  ],
+  "params": {
+    "rt_max": 70,
+    "mz_tolerance": 0.5,
+    "smooth_window": 3,
+    "min_rel_height": 0.05,
+    "min_rel_prominence": 0.05,
+    "min_separation": 3
+  }
+}

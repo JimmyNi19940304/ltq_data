@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ladder Index — LTQ chromatogram and MSn workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div>
+    <h1>Ladder Index</h1>
+    <p>Retention times from a Thermo LTQ run, on the glucose-unit scale of your ladder.</p>
+  </div>
+  <div class="masthead-status">
+    <span class="dot" id="parser-dot"></span>
+    <span id="parser-text">Checking the file reader…</span>
+  </div>
+</header>
+
+<main class="wizard">
+
+  <ol class="rail" id="rail">
+    <li data-step="1"><span>1</span>Input data</li>
+    <li data-step="2"><span>2</span>Chromatograms</li>
+    <li data-step="3"><span>3</span>Mass spectra</li>
+    <li data-step="4"><span>4</span>Download</li>
+  </ol>
+
+  <div class="alert hidden" id="alert"></div>
+
+  <!-- ======================= working ======================= -->
+  <section class="panel working hidden" id="working">
+    <div class="progress-head">
+      <strong id="working-title">Working</strong>
+      <span class="mono" id="working-pct">0%</span>
+    </div>
+    <div class="bar"><i id="working-bar"></i></div>
+    <p id="working-message">Starting</p>
+    <p class="note" id="working-hint"></p>
+  </section>
+
+  <!-- ======================= step 1 ======================= -->
+  <section class="panel step" id="step-1">
+    <div class="panel-head">
+      <h2>Input data</h2>
+      <p>One ladder run and at least one compound. Both are required.</p>
+    </div>
+
+    <form id="setup">
+      <div class="split">
+        <section class="card">
+          <h3>Ladder run</h3>
+          <label class="field"><span>Ladder .raw file</span>
+            <input type="file" name="ladder_file" accept=".raw"></label>
+          <label class="field"><span>or a path on this computer</span>
+            <input type="text" name="ladder_path" spellcheck="false"
+                   placeholder="/data/20210129_Ladder_1.raw"></label>
+          <label class="field"><span>Ladder masses</span>
+            <input type="text" name="ladder_masses" class="mono" spellcheck="false"
+                   value="365, 527, 689, 851, 1013, 1175, 1337, 1499">
+            <em>Two peaks per mass, numbered 1 upward by retention time.</em></label>
+        </section>
+
+        <section class="card" id="standard-card">
+          <h3>Standard time axis</h3>
+          <p class="note" id="standard-line">Checking for a saved standard ladder…</p>
+          <label class="field" id="model-field"><span>Transform onto the standard</span>
+            <select name="transform_model" id="transform-model">
+              <option value="linear">Linear &mdash; ax + b</option>
+              <option value="quadratic" selected>Quadratic &mdash; ax&sup2; + bx + c</option>
+              <option value="cubic">Cubic &mdash; ax&sup3; + bx&sup2; + cx + d</option>
+            </select>
+            <em>The ladder above is fitted onto the saved standard with this model, and
+            the same transform is applied to every compound in this run.</em></label>
+        </section>
+
+        <section class="card">
+          <div class="card-head">
+            <h3>Compounds</h3>
+            <button type="button" class="ghost small" id="add-compound">Add compound</button>
+          </div>
+          <div id="compounds"></div>
+          <p class="note">Up to five. Each needs a name, a nominal mass and a file.</p>
+        </section>
+      </div>
+
+      <details class="card settings">
+        <summary>Peak-finding settings</summary>
+        <div class="grid4">
+          <label class="field"><span>Ignore after (min)</span>
+            <input type="number" name="rt_max" class="mono" step="1" min="0" value="70"></label>
+          <label class="field"><span>m/z tolerance (Da)</span>
+            <input type="number" name="mz_tolerance" class="mono" step="0.05" min="0.05" value="0.5"></label>
+          <label class="field"><span>Smoothing (scans)</span>
+            <input type="number" name="smooth_window" class="mono" step="1" min="1" value="3"></label>
+          <label class="field"><span>Minimum height</span>
+            <input type="number" name="min_rel_height" class="mono" step="0.01" min="0" max="1" value="0.05"></label>
+          <label class="field"><span>Minimum prominence</span>
+            <input type="number" name="min_rel_prominence" class="mono" step="0.01" min="0" max="1" value="0.05"></label>
+          <label class="field"><span>Peak separation (scans)</span>
+            <input type="number" name="min_separation" class="mono" step="1" min="1" value="3"></label>
+          <label class="field"><span>Peak window height</span>
+            <input type="number" name="window_rel_height" class="mono" step="0.05" min="0.05" max="0.95" value="0.9"></label>
+          <label class="field"><span>Spectrum merge (Da)</span>
+            <input type="number" name="spectrum_mz_tolerance" class="mono" step="0.05" min="0.05" value="0.3"></label>
+          <label class="field"><span>Labels per spectrum</span>
+            <input type="number" name="spectrum_label_count" class="mono" step="1" min="1" value="12"></label>
+        </div>
+        <p class="note">Scans after the retention-time limit are dropped before
+        anything else happens, so nothing past it reaches a chromatogram, a peak or a
+        spectrum. Set it to 0 to keep the whole run. Peak window height sets where the
+        accumulation window is cut: 0.9 takes nearly the whole peak, 0.5 would be the
+        width at half maximum.</p>
+      </details>
+
+      <div class="panel-actions">
+        <button type="submit" class="primary" id="run">Generate chromatograms</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- ======================= step 2 ======================= -->
+  <section class="panel step hidden" id="step-2">
+    <div class="panel-head">
+      <h2>Chromatograms</h2>
+      <p id="chrom-caption"></p>
+    </div>
+
+    <div id="ruler-wrap"></div>
+    <div id="chrom-figures"></div>
+
+    <section class="card calib">
+      <h3>Ladder range used for calibration</h3>
+      <p class="note">Compound indices are interpolated between these ladder peaks.
+      Trim the top of the ladder if its last peaks are weak or poorly resolved.</p>
+      <div class="calib-row">
+        <label class="field inline"><span>Use ladder index up to</span>
+          <select id="ladder-limit" class="mono"></select></label>
+        <button type="button" class="ghost" id="apply-limit">Apply and replot</button>
+      </div>
+    </section>
+
+    <div id="index-table"></div>
+
+    <div class="gate">
+      <div>
+        <h3>Do these chromatograms look right?</h3>
+        <p>The mass spectra are built from the shaded windows, so check those first.</p>
+      </div>
+      <div class="gate-buttons">
+        <button type="button" class="ghost" id="say-no">No, go back and adjust</button>
+        <button type="button" class="primary" id="say-yes">Yes, plot the mass spectra</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= step 3 ======================= -->
+  <section class="panel step hidden" id="step-3">
+    <div class="panel-head">
+      <h2>Mass spectra</h2>
+      <p id="spec-caption"></p>
+    </div>
+    <div id="spec-figures"></div>
+    <div class="panel-actions split-actions">
+      <button type="button" class="ghost" id="back-to-chrom">Back to chromatograms</button>
+      <button type="button" class="primary" id="to-download">Continue to download</button>
+    </div>
+  </section>
+
+  <!-- ======================= step 4 ======================= -->
+  <section class="panel step hidden" id="step-4">
+    <div class="panel-head">
+      <h2>Download</h2>
+      <p>Everything you just approved, as files you can keep.</p>
+    </div>
+    <ul class="manifest" id="manifest"></ul>
+    <div class="gate">
+      <div>
+        <h3>Create the results file</h3>
+        <p>Figures are re-rendered at print resolution, so this takes a few seconds.</p>
+      </div>
+      <div class="gate-buttons">
+        <button type="button" class="ghost" id="back-to-spectra">Back to spectra</button>
+        <button type="button" class="primary" id="build-export">Create results file</button>
+        <a class="primary hidden" id="download" href="#">Download .zip</a>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<div class="lightbox hidden" id="lightbox"><img alt="" id="lightbox-img"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

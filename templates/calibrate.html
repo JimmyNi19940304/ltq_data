@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ladder Calibration — retention time between LTQ runs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/calibrate.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div>
+    <h1>Ladder Calibration</h1>
+    <p>Fit every ladder run's retention times onto one chosen standard.</p>
+  </div>
+  <div class="masthead-status">
+    <span class="dot" id="parser-dot"></span>
+    <span id="parser-text">Checking…</span>
+  </div>
+</header>
+
+<main class="wizard">
+
+  <ol class="rail" id="rail">
+    <li data-step="1"><span>1</span>Ladders and standard</li>
+    <li data-step="2"><span>2</span>Calibration fits</li>
+  </ol>
+
+  <div class="alert hidden" id="alert"></div>
+
+  <section class="panel working hidden" id="working">
+    <div class="progress-head">
+      <strong id="working-title">Working</strong>
+      <span class="mono" id="working-pct">0%</span>
+    </div>
+    <div class="bar"><i id="working-bar"></i></div>
+    <p id="working-message">Starting</p>
+    <p class="note">The first read of each .raw takes roughly half a minute.
+    Converted scans are cached and shared with the main app.</p>
+  </section>
+
+  <!-- ============================ page 1 ============================ -->
+  <section class="panel step" id="step-1">
+    <div class="panel-head">
+      <h2>Ladders and standard</h2>
+      <p id="dir-line">Reading config.json…</p>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" class="ghost" id="rescan">Reload from ladder_dir</button>
+      <button type="button" class="ghost" id="reset-indexes">Tick every index everywhere</button>
+      <span class="note" id="file-count"></span>
+    </div>
+
+    <div id="ladder-list"></div>
+
+    <div class="gate hidden" id="standard-gate">
+      <div>
+        <h3>Standard ladder</h3>
+        <p id="standard-line">Pick the run everything else is calibrated onto.</p>
+      </div>
+      <div class="gate-buttons">
+        <button type="button" class="primary" id="to-fits" disabled>Fit the other ladders</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ page 2 ============================ -->
+  <section class="panel step hidden" id="step-2">
+    <div class="panel-head">
+      <h2>Calibration fits</h2>
+      <p id="fit-caption"></p>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" class="ghost" id="back-to-1">Back to ladders</button>
+      <button type="button" class="ghost" id="download-summary">Download summary CSV</button>
+    </div>
+
+    <div id="fits"></div>
+
+    <section class="card summary" id="summary-card">
+      <h3>Summary across all ladders</h3>
+      <div id="summary-body"></div>
+    </section>
+
+    <div class="gate" id="save-standard-gate">
+      <div>
+        <h3>Save this as the standard</h3>
+        <p id="save-standard-line">Writes the ladder's index table to
+        <span class="mono" id="save-standard-path">standard_ladder/</span> so the main
+        app can put compounds on this run's time axis.</p>
+      </div>
+      <div class="gate-buttons">
+        <span class="saved-note hidden" id="saved-note"></span>
+        <button type="button" class="primary" id="save-standard">Save as standard</button>
+      </div>
+    </div>
+  </section>
+
+</main>
+<script src="/static/calibrate.js"></script>
+</body>
+</html>
