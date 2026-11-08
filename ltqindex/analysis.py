@@ -183,6 +183,16 @@ class Ladder:
                 f"Only {self.n_points} of {expected} ladder peaks were found. "
                 "Lower the minimum peak height, or check the ladder file."
             )
+        # indexes are numbered in order across the peaks found, so a mass short of
+        # a peak pushes every later index down by one
+        counts = [len(tr["peaks"]) for tr in self.traces]
+        for k, tr in enumerate(self.traces):
+            if counts[k] < 2 and any(c > 0 for c in counts[k + 1:]):
+                out.append(
+                    f"m/z {tr['mass']:g} has {counts[k]} peak(s) instead of 2, so every "
+                    "index after it is numbered lower than in a complete ladder."
+                )
+                break
         if not self.is_monotonic:
             rts = self.rt_points[: self.limit]
             bad = [

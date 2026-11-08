@@ -114,41 +114,9 @@ function showLadders(d) {
   const warnings = [];
   for (const l of d.ladders) warnings.push(...l.warnings.map(w => `${l.name}: ${w}`));
 
-  for (const l of d.ladders) {
-    const card = document.createElement("div");
-    card.className = "ladder";
-    card.dataset.name = l.name;
-    const badge = l.monotonic ? "" :
-      `<span class="badge">retention times not increasing</span>`;
-    card.id = "ladder-card-" + cardId(l.name);
-    card.innerHTML = `
-      <div class="ladder-head">
-        <label><input type="radio" name="standard" value="${esc(l.name)}"> ${esc(l.name)}</label>
-        ${badge}
-        <span class="meta" data-role="count"></span>
-      </div>
-      <div class="ladder-body">
-        <div class="ladder-plot">
-          <img src="/api/figure/${encodeURIComponent(l.figure)}?t=${Date.now()}" alt="${esc(l.name)} chromatogram">
-        </div>
-        <div class="ladder-indexes">
-          <h4>Indexes to fit with</h4>
-          <p class="note">Unticked indexes are left out of every fit this ladder
-          takes part in, including when it is the standard.</p>
-          <div class="index-list" data-role="list"></div>
-          <div class="index-actions">
-            <button type="button" class="ghost small" data-role="all">All</button>
-            <button type="button" class="ghost small" data-role="none">None</button>
-          </div>
-        </div>
-      </div>`;
-    card.querySelector("input[name=standard]").onchange = () => chooseStandard(l.name);
-    buildIndexList(card, l);
-    box.appendChild(card);
-  }
+  for (const l of d.ladders) box.appendChild(ladderCard(l));
   if (d.mixed_peak_counts) {
-    warnings.push("The ladders did not all yield the same number of peaks. " +
-      "Only indexes found in both runs take part in a fit.");
+    warnings.push(MIXED_WARNING);
   }
   showAlert("Worth checking", warnings);
 
@@ -164,6 +132,104 @@ function showLadders(d) {
     state.reached = 1;
   }
   goStep(1);
+}
+
+const MIXED_WARNING = "The ladders did not all yield the same number of peaks. " +
+  "Only indexes found in both runs take part in a fit.";
+
+function ladderCard(l) {
+    const card = document.createElement("div");
+    card.className = "ladder";
+    card.dataset.name = l.name;
+    const badge = l.monotonic ? "" :
+      `<span class="badge">retention times not increasing</span>`;
+    const custom = l.rt_max_custom ?
+      `<span class="badge custom">own rt_max</span>` : "";
+    const cardWarnings = (l.warnings || []).length ?
+      `<ul class="card-warnings">${l.warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul>` : "";
+    card.id = "ladder-card-" + cardId(l.name);
+    card.innerHTML = `
+      <div class="ladder-head">
+        <label><input type="radio" name="standard" value="${esc(l.name)}"> ${esc(l.name)}</label>
+        ${badge}${custom}
+        <span class="meta" data-role="count"></span>
+      </div>
+      <div class="ladder-body">
+        <div class="ladder-plot">
+          <img src="/api/figure/${encodeURIComponent(l.figure)}?t=${Date.now()}" alt="${esc(l.name)} chromatogram">
+          <form class="rt-max" data-role="rt-max">
+            <label>Retention time limit
+              <input type="number" class="mono" min="0.1" step="0.1"
+                value="${l.rt_max}" data-role="rt-max-input"> min</label>
+            <button type="submit" class="ghost small">Apply</button>
+            ${l.rt_max_custom ? `<button type="button" class="ghost small"
+              data-role="rt-max-reset">Back to ${l.rt_max_default} (config)</button>` :
+              `<span class="note">config default</span>`}
+            <span class="note" data-role="rt-max-status"></span>
+          </form>
+          ${cardWarnings}
+        </div>
+        <div class="ladder-indexes">
+          <h4>Indexes to fit with</h4>
+          <p class="note">Unticked indexes are left out of every fit this ladder
+          takes part in, including when it is the standard.</p>
+          <div class="index-list" data-role="list"></div>
+          <div class="index-actions">
+            <button type="button" class="ghost small" data-role="all">All</button>
+            <button type="button" class="ghost small" data-role="none">None</button>
+          </div>
+        </div>
+      </div>`;
+    card.querySelector("input[name=standard]").onchange = () => chooseStandard(l.name);
+    if (state.standard === l.name) {
+      card.querySelector("input[name=standard]").checked = true;
+      card.classList.add("chosen");
+    }
+    card.querySelector("[data-role=rt-max]").onsubmit = (ev) => {
+      ev.preventDefault();
+      applyRtMax(l.name, card.querySelector("[data-role=rt-max-input]").value);
+    };
+    const reset = card.querySelector("[data-role=rt-max-reset]");
+    if (reset) reset.onclick = () => applyRtMax(l.name, null);
+    buildIndexList(card, l);
+    return card;
+}
+
+/* Re-pick one ladder's peaks with its own rt_max. The ticks are rebuilt from the
+   peaks found inside the new limit, all ticked, since index numbers may have moved. */
+function applyRtMax(name, value) {
+  const card = $("ladder-card-" + cardId(name));
+  const status = card && card.querySelector("[data-role=rt-max-status]");
+  card && card.querySelectorAll("[data-role=rt-max] button, [data-role=rt-max] input")
+    .forEach(el => { el.disabled = true; });
+  if (status) status.textContent = "Re-picking peaks…";
+  return fetch("/api/ladder/rt_max", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, rt_max: value }),
+  }).then(r => r.json()).then(d => {
+    if (d.error) throw new Error(d.error);
+    const l = d.ladder;
+    const i = state.ladders.findIndex(x => x.name === name);
+    if (i >= 0) state.ladders[i] = l;
+    delete state.selections[name];
+    const fresh = ladderCard(l);
+    card.replaceWith(fresh);
+    // any fit shown on page 2 used the old peaks
+    state.last = null;
+    state.reached = 1;
+    paintRail(1);
+    const warnings = [];
+    for (const x of state.ladders) warnings.push(...x.warnings.map(w => `${x.name}: ${w}`));
+    if (d.mixed_peak_counts) warnings.push(MIXED_WARNING);
+    showAlert("Worth checking", warnings);
+    const s = fresh.querySelector("[data-role=rt-max-status]");
+    if (s) s.textContent = `${l.n_peaks} peaks; ticks reset`;
+  }).catch(e => {
+    card && card.querySelectorAll("[data-role=rt-max] button, [data-role=rt-max] input")
+      .forEach(el => { el.disabled = false; });
+    if (status) status.textContent = "";
+    showAlert(`Could not apply the limit to ${name}`, [e.message]);
+  });
 }
 
 const cardId = (name) => name.replace(/[^A-Za-z0-9_-]/g, "_");

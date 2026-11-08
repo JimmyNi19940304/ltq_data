@@ -75,6 +75,14 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .ladder-body{display:grid;grid-template-columns:minmax(0,1fr) 210px}
 .ladder-plot{min-width:0;border-right:1px solid var(--rule-soft)}
 .ladder img{display:block;width:100%;height:auto}
+.ladder-head .badge.custom{background:#E8F3F4;color:#0B5F66}
+.rt-max{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 16px;
+  border-top:1px solid var(--rule-soft);font-size:13px}
+.rt-max label{display:flex;align-items:center;gap:7px}
+.rt-max input{width:80px;padding:4px 6px;border:1px solid var(--rule-soft);border-radius:3px;font-size:13px}
+.rt-max .note{margin:0}
+.card-warnings{margin:0;padding:8px 16px 10px 32px;font-size:12.5px;color:#7A2F14;
+  border-top:1px solid var(--rule-soft);background:#FCF3EF}
 .ladder-indexes{padding:14px 16px;background:#FBFCFC}
 .ladder-indexes h4{font-size:12px;color:var(--muted);font-weight:500;margin-bottom:6px}
 .ladder-indexes .note{margin-bottom:10px}
