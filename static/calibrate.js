@@ -109,6 +109,7 @@ function scan() {
 
 function showLadders(d) {
   state.ladders = d.ladders;
+  state.editing = null;     // a reload replaces every card, open editor included
   const box = $("ladder-list");
   box.innerHTML = "";
   const warnings = [];
@@ -166,6 +167,8 @@ function ladderCard(l) {
               data-role="rt-max-reset">Back to ${l.rt_max_default} (config)</button>` :
               `<span class="note">config default</span>`}
             <span class="note" data-role="rt-max-status"></span>
+            <button type="button" class="ghost small edit-peaks"
+              data-role="edit-peaks">Edit peaks</button>
           </form>
           ${cardWarnings}
         </div>
@@ -191,6 +194,7 @@ function ladderCard(l) {
     };
     const reset = card.querySelector("[data-role=rt-max-reset]");
     if (reset) reset.onclick = () => applyRtMax(l.name, null);
+    card.querySelector("[data-role=edit-peaks]").onclick = () => openPeakEditor(l.name);
     buildIndexList(card, l);
     return card;
 }
@@ -208,28 +212,34 @@ function applyRtMax(name, value) {
     body: JSON.stringify({ name, rt_max: value }),
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
-    const l = d.ladder;
-    const i = state.ladders.findIndex(x => x.name === name);
-    if (i >= 0) state.ladders[i] = l;
-    delete state.selections[name];
-    const fresh = ladderCard(l);
-    card.replaceWith(fresh);
-    // any fit shown on page 2 used the old peaks
-    state.last = null;
-    state.reached = 1;
-    paintRail(1);
-    const warnings = [];
-    for (const x of state.ladders) warnings.push(...x.warnings.map(w => `${x.name}: ${w}`));
-    if (d.mixed_peak_counts) warnings.push(MIXED_WARNING);
-    showAlert("Worth checking", warnings);
-    const s = fresh.querySelector("[data-role=rt-max-status]");
-    if (s) s.textContent = `${l.n_peaks} peaks; ticks reset`;
+    replaceLadder(card, d, `${d.ladder.n_peaks} peaks; ticks reset`);
   }).catch(e => {
     card && card.querySelectorAll("[data-role=rt-max] button, [data-role=rt-max] input")
       .forEach(el => { el.disabled = false; });
     if (status) status.textContent = "";
     showAlert(`Could not apply the limit to ${name}`, [e.message]);
   });
+}
+
+/* Swap in a ladder the server has just re-analysed. Its ticks start over from the
+   new peaks, and any fits already shown on page 2 used the old ones. */
+function replaceLadder(card, d, message) {
+  const l = d.ladder;
+  const i = state.ladders.findIndex(x => x.name === l.name);
+  if (i >= 0) state.ladders[i] = l;
+  delete state.selections[l.name];
+  const fresh = ladderCard(l);
+  card.replaceWith(fresh);
+  state.last = null;
+  state.reached = 1;
+  paintRail(1);
+  const warnings = [];
+  for (const x of state.ladders) warnings.push(...x.warnings.map(w => `${x.name}: ${w}`));
+  if (d.mixed_peak_counts) warnings.push(MIXED_WARNING);
+  showAlert("Worth checking", warnings);
+  const s = fresh.querySelector("[data-role=rt-max-status]");
+  if (s) s.textContent = message;
+  return fresh;
 }
 
 const cardId = (name) => name.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -252,7 +262,9 @@ function buildIndexList(card, l) {
     const row = document.createElement("label");
     row.className = chosen.has(i) ? "" : "off";
     row.innerHTML = `<input type="checkbox" ${chosen.has(i) ? "checked" : ""}>
-      <span class="idx">${i}</span><span class="rt">${l.peaks[i].toFixed(2)}</span>`;
+      <span class="idx">${i}</span><span class="rt">${l.peaks[i].toFixed(2)}</span>
+      ${l.manual && l.manual[i] !== undefined
+        ? '<span class="by-hand" title="placed by hand">◆</span>' : ""}`;
     row.querySelector("input").onchange = (ev) => {
       const set = new Set(state.selections[l.name]);
       ev.target.checked ? set.add(i) : set.delete(i);

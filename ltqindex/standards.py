@@ -50,7 +50,8 @@ def folders(ladder_dir, create=False):
 
 
 def save_standard(ladder_dir, *, name, peaks, masses, params, selected_indexes=None,
-                  source_file=None, n_ladder_peaks=None, note=None):
+                  source_file=None, n_ladder_peaks=None, note=None,
+                  manual_indexes=None, absent_indexes=None):
     """Write the active standard, archiving whatever was there before.
 
     `peaks` maps ladder index -> retention time. Only the indexes in
@@ -79,6 +80,9 @@ def save_standard(ladder_dir, *, name, peaks, masses, params, selected_indexes=N
         "usable_indexes": usable,
         "n_ladder_peaks": int(n_ladder_peaks if n_ladder_peaks is not None else len(peaks)),
         "note": note,
+        # peaks placed by hand on page 1, and indexes marked as having no peak
+        "manual_indexes": sorted(int(i) for i in (manual_indexes or [])),
+        "absent_indexes": sorted(int(i) for i in (absent_indexes or [])),
     }
 
     if paths["standard_file"].exists():

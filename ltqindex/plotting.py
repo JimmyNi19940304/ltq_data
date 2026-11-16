@@ -110,16 +110,23 @@ def plot_ladder(ladder, run_name, path=None, formats=("png",)):
                         textcoords="offset points", ha="center", fontsize=8.5,
                         fontweight="600" if calibrating else "400",
                         color=color if calibrating else HAIRLINE, zorder=5)
-            ax.plot([pk.rt], [y], marker="v", ms=3.5,
+            # a hand-placed peak is a diamond so it stands out from automatic picks
+            ax.plot([pk.rt], [y], marker="D" if pk.manual else "v",
+                    ms=4.5 if pk.manual else 3.5,
                     color=color if calibrating else HAIRLINE, zorder=4)
 
     subtitle = (
         f"extracted ion traces, \u00b1{ladder.params.mz_tolerance:g} Da   |   "
-        f"numbers are ladder index 1\u2013{ladder.n_points}"
+        f"numbers are ladder index 1\u2013{ladder.max_index}"
     )
     if ladder.params.rt_max and ladder.params.rt_max > 0:
         subtitle += f"   |   scans after {ladder.params.rt_max:g} min ignored"
-    if ladder.limit < ladder.n_points:
+    if any(pk.manual for tr in ladder.traces for pk in tr["peaks"]):
+        subtitle += "   |   \u25c6 placed by hand"
+    absent = getattr(ladder, "absent", [])
+    if absent:
+        subtitle += "   |   no peak for index " + ", ".join(str(i) for i in absent)
+    if ladder.limit < ladder.max_index:
         subtitle += (
             f"   |   only index 1\u2013{ladder.limit} used for calibration, "
             "the rest are greyed out"

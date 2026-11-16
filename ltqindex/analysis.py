@@ -66,6 +66,8 @@ class Peak:
     rt_standard_start: Optional[float] = None
     rt_standard_end: Optional[float] = None
     rt_extrapolated: bool = False
+    slot: Optional[int] = None      # 0 or 1: first or second peak of its ladder mass
+    manual: bool = False            # placed by hand rather than by peak picking
 
     to_dict = asdict
 
@@ -99,35 +101,82 @@ def pick_peaks(rt, y, params: Params, n_peaks=2) -> List[Peak]:
     if chosen.size == 0:
         return []
 
-    widths = peak_widths(ys, chosen, rel_height=params.window_rel_height)
-    peaks = []
-    for k, apex in enumerate(chosen):
-        left = float(np.interp(widths[2][k], np.arange(rt.size), rt))
-        right = float(np.interp(widths[3][k], np.arange(rt.size), rt))
-        if right <= left:
-            span = float(np.median(np.diff(rt))) if rt.size > 1 else 0.01
-            left, right = rt[apex] - span, rt[apex] + span
+    return [_measure_peak(rt, y, ys, int(apex), params) for apex in chosen]
 
-        # smoothing can move the apex of a narrow peak by a scan or two, so the
-        # reported time and height come from the raw trace near that position
-        half = max(1, params.smooth_window)
-        lo_i, hi_i = max(0, apex - half), min(y.size, apex + half + 1)
-        i = int(lo_i + np.argmax(y[lo_i:hi_i]))
-        left = min(left, float(rt[i]))
-        right = max(right, float(rt[i]))
-        mask = (rt >= left) & (rt <= right)
-        area = float(np.trapezoid(y[mask], rt[mask])) if mask.sum() > 1 else 0.0
-        peaks.append(
-            Peak(
-                rt=float(rt[i]),
-                height=float(y[i]),
-                area=area,
-                rt_start=left,
-                rt_end=right,
-                scan_index=int(i),
-            )
-        )
-    return peaks
+
+def _measure_peak(rt, y, ys, apex, params: Params) -> Peak:
+    """Edges, apex and area of the peak whose smoothed top is at scan `apex`."""
+    widths = peak_widths(ys, [apex], rel_height=params.window_rel_height)
+    left = float(np.interp(widths[2][0], np.arange(rt.size), rt))
+    right = float(np.interp(widths[3][0], np.arange(rt.size), rt))
+    if right <= left:
+        span = float(np.median(np.diff(rt))) if rt.size > 1 else 0.01
+        left, right = rt[apex] - span, rt[apex] + span
+
+    # smoothing can move the apex of a narrow peak by a scan or two, so the
+    # reported time and height come from the raw trace near that position
+    half = max(1, params.smooth_window)
+    lo_i, hi_i = max(0, apex - half), min(y.size, apex + half + 1)
+    i = int(lo_i + np.argmax(y[lo_i:hi_i]))
+    left = min(left, float(rt[i]))
+    right = max(right, float(rt[i]))
+    mask = (rt >= left) & (rt <= right)
+    area = float(np.trapezoid(y[mask], rt[mask])) if mask.sum() > 1 else 0.0
+    return Peak(rt=float(rt[i]), height=float(y[i]), area=area,
+                rt_start=left, rt_end=right, scan_index=int(i))
+
+
+def climb(ys, start):
+    """Walk uphill on a trace from scan `start` to the top of the peak it is on.
+
+    The browser editor runs the same walk, so where a click lands on screen is
+    where the server puts the peak.
+    """
+    i = int(min(max(start, 0), ys.size - 1))
+    while True:
+        left = ys[i - 1] if i > 0 else -np.inf
+        right = ys[i + 1] if i + 1 < ys.size else -np.inf
+        if right > ys[i] and right >= left:
+            i += 1
+        elif left > ys[i]:
+            i -= 1
+        else:
+            return i
+
+
+def snap_peak(rt, y, params: Params, target_rt) -> Optional[Peak]:
+    """The peak whose top is reached by walking uphill from `target_rt`.
+
+    None when the time lies outside the trace, for instance past rt_max.
+    """
+    y = np.asarray(y, float)
+    if y.size < 3 or target_rt is None:
+        return None
+    step = float(np.median(np.diff(rt))) if rt.size > 1 else 0.0
+    if target_rt < rt[0] - step or target_rt > rt[-1] + step:
+        return None
+    ys = smooth(y, params.smooth_window)
+    start = int(np.argmin(np.abs(rt - float(target_rt))))
+    peak = _measure_peak(rt, y, ys, climb(ys, start), params)
+    peak.manual = True
+    return peak
+
+
+def candidate_peaks(rt, y, params: Params, n=6):
+    """The n tallest peaks of a trace as (rt, height), for the editor to offer."""
+    y = np.asarray(y, float)
+    if y.size < 3 or y.max() <= 0:
+        return []
+    ys = smooth(y, params.smooth_window)
+    ceiling = ys.max()
+    idx, props = find_peaks(ys, height=0.02 * ceiling, prominence=0.02 * ceiling,
+                            distance=params.min_separation)
+    order = np.argsort(props["peak_heights"])[::-1][:n]
+    out = []
+    for k in np.sort(idx[order]):
+        top = _measure_peak(rt, y, ys, int(k), params)
+        out.append((round(top.rt, 4), float(top.height)))
+    return out
 
 
 # ------------------------------------------------------------------- ladder
@@ -139,32 +188,56 @@ class Ladder:
     indices, which matters when the top of the ladder is weak or poorly resolved.
     """
 
-    def __init__(self, traces, params: Params, limit=None):
+    def __init__(self, traces, params: Params, limit=None, fixed_slots=False):
+        """`fixed_slots` numbers every peak by its place in the full ladder,
+        index = 2 x (mass position) + slot + 1, so a missing peak leaves a gap
+        instead of pulling every later index down by one. Without it the peaks
+        found are simply counted 1, 2, 3..."""
         self.traces = traces          # [{mass, rt, intensity, peaks:[Peak, Peak]}]
         self.params = params
+        self.fixed_slots = fixed_slots
         rts, indices = [], []
         n = 1
-        for tr in traces:
-            for pk in tr["peaks"]:
-                pk.index = float(n)
+        for m, tr in enumerate(traces):
+            for k, pk in enumerate(tr["peaks"]):
+                if fixed_slots:
+                    if pk.slot is None:
+                        pk.slot = k
+                    pk.index = float(2 * m + pk.slot + 1)
+                else:
+                    pk.index = float(n)
+                    n += 1
                 rts.append(pk.rt)
-                indices.append(float(n))
-                n += 1
-        self.rt_points = np.asarray(rts, float)
-        self.index_points = np.asarray(indices, float)
+                indices.append(pk.index)
+        order = np.argsort(indices, kind="stable")
+        self.rt_points = np.asarray(rts, float)[order]
+        self.index_points = np.asarray(indices, float)[order]
         self.limit = self.set_limit(limit)
+
+    @property
+    def max_index(self):
+        return int(self.index_points.max()) if self.index_points.size else 0
+
+    @property
+    def missing_indexes(self):
+        """Ladder positions with no peak; only meaningful with fixed slots."""
+        if not self.fixed_slots:
+            return []
+        present = {int(i) for i in self.index_points}
+        return [i for i in range(1, 2 * len(self.traces) + 1) if i not in present]
 
     def set_limit(self, limit):
         if limit in (None, "", "all"):
-            self.limit = self.n_points
+            self.limit = self.max_index
         else:
-            self.limit = max(2, min(int(limit), self.n_points))
+            self.limit = max(2, min(int(limit), self.max_index))
         return self.limit
 
     @property
     def calibration(self):
         """The (retention times, indices) actually used for interpolation."""
-        return self.rt_points[: self.limit], self.index_points[: self.limit]
+        keep = self.index_points <= self.limit
+        return self.rt_points[keep], self.index_points[keep]
 
     @property
     def n_points(self):
@@ -172,13 +245,18 @@ class Ladder:
 
     @property
     def is_monotonic(self):
-        rts = self.rt_points[: self.limit]
+        rts = self.calibration[0]
         return bool(rts.size > 1 and np.all(np.diff(rts) > 0))
 
     def warnings(self):
         out = []
         expected = 2 * len(self.traces)
-        if self.n_points < expected:
+        if self.n_points < expected and self.fixed_slots:
+            out.append(
+                f"{self.n_points} of {expected} ladder peaks in use; no peak for index "
+                + ", ".join(str(i) for i in self.missing_indexes) + "."
+            )
+        elif self.n_points < expected:
             out.append(
                 f"Only {self.n_points} of {expected} ladder peaks were found. "
                 "Lower the minimum peak height, or check the ladder file."
@@ -187,6 +265,8 @@ class Ladder:
         # a peak pushes every later index down by one
         counts = [len(tr["peaks"]) for tr in self.traces]
         for k, tr in enumerate(self.traces):
+            if self.fixed_slots:
+                break
             if counts[k] < 2 and any(c > 0 for c in counts[k + 1:]):
                 out.append(
                     f"m/z {tr['mass']:g} has {counts[k]} peak(s) instead of 2, so every "
@@ -194,9 +274,9 @@ class Ladder:
                 )
                 break
         if not self.is_monotonic:
-            rts = self.rt_points[: self.limit]
+            rts, idx = self.calibration
             bad = [
-                f"index {int(self.index_points[i])} at {rts[i]:.2f} min"
+                f"index {int(idx[i])} at {rts[i]:.2f} min"
                 for i in range(1, rts.size)
                 if rts[i] <= rts[i - 1]
             ]
@@ -238,12 +318,20 @@ class Ladder:
                         "rt_start": round(pk.rt_start, 4),
                         "rt_end": round(pk.rt_end, 4),
                         "calibrating": int(pk.index) <= self.limit,
+                        "manual": pk.manual,
                     }
                 )
         return sorted(rows, key=lambda r: r["index"])
 
 
-def analyse_ladder(run: Run, masses, params: Params, limit=None) -> Ladder:
+def analyse_ladder(run: Run, masses, params: Params, limit=None, manual=None,
+                   fixed_slots=False) -> Ladder:
+    """Extract and peak-pick every ladder mass.
+
+    `manual` maps ladder index -> retention time to place that peak by hand, or
+    None to say the index has no peak. It implies fixed slots. Picks that land
+    outside the trace (past rt_max) are ignored and listed in `ladder.dropped`.
+    """
     ms1 = run.level(1)
     if not len(ms1):
         raise ValueError(
@@ -255,20 +343,46 @@ def analyse_ladder(run: Run, masses, params: Params, limit=None) -> Ladder:
             f"{run.source_name} has {n} MS1 scan(s) at or before "
             f"{params.rt_max:g} min. Raise the retention-time limit."
         )
+    manual = {int(k): v for k, v in (manual or {}).items()}
+    fixed_slots = fixed_slots or bool(manual)
     rt = ms1.rt[:n]
-    traces = []
-    for mass in masses:
+    traces, auto_rt, absent, dropped = [], {}, [], []
+    for m, mass in enumerate(masses):
         y = ms1.xic(float(mass), params.mz_tolerance)[:n]
+        found = pick_peaks(rt, y, params, n_peaks=2)
+        slots = {}
+        for k, pk in enumerate(found):
+            pk.slot = k
+            slots[k] = pk
+            auto_rt[2 * m + k + 1] = pk.rt
+        for k in (0, 1):
+            index = 2 * m + k + 1
+            if index not in manual:
+                continue
+            if manual[index] is None:
+                slots.pop(k, None)
+                absent.append(index)
+                continue
+            picked = snap_peak(rt, y, params, manual[index])
+            if picked is None:
+                dropped.append(index)
+                continue
+            picked.slot = k
+            slots[k] = picked
         traces.append(
             {
                 "mass": float(mass),
                 "rt": rt,
                 "intensity": y,
                 "smoothed": smooth(y, params.smooth_window),
-                "peaks": pick_peaks(rt, y, params, n_peaks=2),
+                "peaks": [slots[k] for k in sorted(slots)],
             }
         )
-    return Ladder(traces, params, limit=limit)
+    ladder = Ladder(traces, params, limit=limit, fixed_slots=fixed_slots)
+    ladder.auto_rt = auto_rt
+    ladder.absent = sorted(absent)
+    ladder.dropped = sorted(dropped)
+    return ladder
 
 
 # ----------------------------------------------------------------- compound
