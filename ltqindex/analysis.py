@@ -68,6 +68,7 @@ class Peak:
     rt_extrapolated: bool = False
     slot: Optional[int] = None      # 0 or 1: first or second peak of its ladder mass
     manual: bool = False            # placed by hand rather than by peak picking
+    exact: bool = False             # placed on the clicked scan, without snapping
 
     to_dict = asdict
 
@@ -104,8 +105,15 @@ def pick_peaks(rt, y, params: Params, n_peaks=2) -> List[Peak]:
     return [_measure_peak(rt, y, ys, int(apex), params) for apex in chosen]
 
 
-def _measure_peak(rt, y, ys, apex, params: Params) -> Peak:
-    """Edges, apex and area of the peak whose smoothed top is at scan `apex`."""
+def _measure_peak(rt, y, ys, apex, params: Params, raw_apex=None) -> Peak:
+    """Edges, apex and area of the peak whose smoothed top is at scan `apex`.
+
+    The reported time and height come from the raw trace. Smoothing can move a
+    narrow peak's top by a scan or two, so unless `raw_apex` fixes the scan, the
+    raw top is found by walking uphill on the raw trace from the smoothed top.
+    The walk cannot cross a dip, so on sparse data it never lands on the shoulder
+    of a neighbouring peak, as a "tallest point within a few scans" rule could.
+    """
     widths = peak_widths(ys, [apex], rel_height=params.window_rel_height)
     left = float(np.interp(widths[2][0], np.arange(rt.size), rt))
     right = float(np.interp(widths[3][0], np.arange(rt.size), rt))
@@ -113,11 +121,7 @@ def _measure_peak(rt, y, ys, apex, params: Params) -> Peak:
         span = float(np.median(np.diff(rt))) if rt.size > 1 else 0.01
         left, right = rt[apex] - span, rt[apex] + span
 
-    # smoothing can move the apex of a narrow peak by a scan or two, so the
-    # reported time and height come from the raw trace near that position
-    half = max(1, params.smooth_window)
-    lo_i, hi_i = max(0, apex - half), min(y.size, apex + half + 1)
-    i = int(lo_i + np.argmax(y[lo_i:hi_i]))
+    i = int(raw_apex) if raw_apex is not None else climb(y, apex)
     left = min(left, float(rt[i]))
     right = max(right, float(rt[i]))
     mask = (rt >= left) & (rt <= right)
@@ -144,10 +148,13 @@ def climb(ys, start):
             return i
 
 
-def snap_peak(rt, y, params: Params, target_rt) -> Optional[Peak]:
-    """The peak whose top is reached by walking uphill from `target_rt`.
+def snap_peak(rt, y, params: Params, target_rt, exact=False) -> Optional[Peak]:
+    """A hand-placed peak at `target_rt`.
 
-    None when the time lies outside the trace, for instance past rt_max.
+    The walk uphill is on the raw trace, the one the editor draws, so a click
+    lands on the top of the peak it was made on. With `exact` the peak is put on
+    the scan nearest `target_rt` with no walk at all. None when the time lies
+    outside the trace, for instance past rt_max.
     """
     y = np.asarray(y, float)
     if y.size < 3 or target_rt is None:
@@ -157,8 +164,11 @@ def snap_peak(rt, y, params: Params, target_rt) -> Optional[Peak]:
         return None
     ys = smooth(y, params.smooth_window)
     start = int(np.argmin(np.abs(rt - float(target_rt))))
-    peak = _measure_peak(rt, y, ys, climb(ys, start), params)
+    top = start if exact else climb(y, start)
+    # edges and area come from the smoothed peak this scan sits on
+    peak = _measure_peak(rt, y, ys, climb(ys, top), params, raw_apex=top)
     peak.manual = True
+    peak.exact = bool(exact)
     return peak
 
 
@@ -328,7 +338,9 @@ def analyse_ladder(run: Run, masses, params: Params, limit=None, manual=None,
                    fixed_slots=False) -> Ladder:
     """Extract and peak-pick every ladder mass.
 
-    `manual` maps ladder index -> retention time to place that peak by hand, or
+    `manual` maps ladder index -> retention time to place that peak by hand
+    (snapped to the top of the peak it lies on), {"rt": t, "exact": True} to put
+    it on that scan as is, or
     None to say the index has no peak. It implies fixed slots. Picks that land
     outside the trace (past rt_max) are ignored and listed in `ladder.dropped`.
     """
@@ -363,7 +375,12 @@ def analyse_ladder(run: Run, masses, params: Params, limit=None, manual=None,
                 slots.pop(k, None)
                 absent.append(index)
                 continue
-            picked = snap_peak(rt, y, params, manual[index])
+            pick = manual[index]
+            if isinstance(pick, dict):        # {"rt": minutes, "exact": true}
+                picked = snap_peak(rt, y, params, pick.get("rt"),
+                                   exact=bool(pick.get("exact")))
+            else:
+                picked = snap_peak(rt, y, params, pick)
             if picked is None:
                 dropped.append(index)
                 continue

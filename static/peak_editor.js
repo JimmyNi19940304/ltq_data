@@ -1,9 +1,10 @@
 /* Page 1 peak editor: place ladder peaks by hand on one ladder card.
 
    Pick an index in the list, then click its peak on the chart. A click walks
-   uphill on that index's own mass trace to the top of the peak it landed on, the
-   same walk the server does when the picks are saved, so the peak goes where it
-   is shown. Drag across the chart to zoom; "Whole run" zooms back out.
+   uphill on that index's own raw mass trace, the line drawn, to the top of the
+   peak it landed on; the server does the same walk when the picks are saved, so
+   the peak goes where it is shown. Shift-click puts the peak on the clicked scan
+   with no walk at all. Drag across the chart to zoom; "Whole run" zooms back out.
 
    Shares the page's globals from calibrate.js: $, esc, state, cardId, ladderCard,
    replaceLadder, showAlert. */
@@ -39,20 +40,6 @@ function openPeakEditor(name) {
 }
 
 /* --------------------------------------------------------------- numbers */
-function movingAverage(y, w) {
-  // matches numpy.convolve(y, ones(w)/w, mode="same") used on the server
-  const n = y.length;
-  if (w <= 1 || n < w) return y.slice();
-  const before = w - 1 - Math.floor((w - 1) / 2), after = Math.floor((w - 1) / 2);
-  const out = new Array(n);
-  for (let i = 0; i < n; i++) {
-    let sum = 0;
-    for (let j = i - before; j <= i + after; j++) if (j >= 0 && j < n) sum += y[j];
-    out[i] = sum / w;
-  }
-  return out;
-}
-
 function nearestScan(rt, t) {
   let lo = 0, hi = rt.length - 1;
   while (hi - lo > 1) {
@@ -84,9 +71,10 @@ function startEditor(card, l, t) {
   const n = t.rt.length;
   const ed = {
     card, l, t,
-    smooth: t.traces.map(tr => movingAverage(tr.intensity, t.smooth_window)),
     expected: l.expected,
     picks: {},            // index -> rt placed by hand, or null for "no peak"
+    exact: new Set(l.exact || []),   // picks put on the clicked scan, unsnapped
+    shift: false,
     active: null,
     view: [t.rt[0], t.rt[n - 1]],
     hoverX: null,
@@ -118,7 +106,8 @@ function startEditor(card, l, t) {
   const side = card.querySelector(".ladder-indexes");
   side.innerHTML = `
     <h4>Choose an index, then click its peak</h4>
-    <p class="note">◆ placed by hand. Red means not later than the index before it.</p>
+    <p class="note">◆ placed by hand, ◇ placed exactly (Shift-click). Red means not
+    later than the index before it.</p>
     <div class="pe-list" data-role="pe-list"></div>`;
   card.classList.add("editing");
 
@@ -131,16 +120,23 @@ function startEditor(card, l, t) {
     ed.view = [t.rt[0], t.rt[n - 1]]; render(ed);
   };
   plot.querySelector("[data-role=auto-all]").onclick = () => {
-    ed.picks = {}; status(ed, "Every index back to its automatic peak (not saved yet)");
+    ed.picks = {}; ed.exact.clear(); status(ed, "Every index back to its automatic peak (not saved yet)");
     renderAll(ed);
   };
   plot.querySelector("[data-role=cancel]").onclick = () => closeEditor(ed);
   plot.querySelector("[data-role=save]").onclick = () => savePeaks(ed);
   ed.onKey = (ev) => {
     if (!document.body.contains(ed.svg)) {
-      document.removeEventListener("keydown", ed.onKey);
+      unbindKeys(ed);
       return;
     }
+    if (ev.key === "Shift") {
+      // the hover ring follows Shift at once, without waiting for the mouse
+      ed.shift = ev.type === "keydown";
+      render(ed);
+      return;
+    }
+    if (ev.type !== "keydown") return;
     if (ev.target.closest && ev.target.closest("input, textarea")) return;
     if (ev.key === "Escape") { ed.active = null; renderAll(ed); }
     if ((ev.key === "ArrowDown" || ev.key === "ArrowUp") && ed.active) {
@@ -150,13 +146,19 @@ function startEditor(card, l, t) {
     }
   };
   document.addEventListener("keydown", ed.onKey);
+  document.addEventListener("keyup", ed.onKey);
   bindPointer(ed);
   renderAll(ed);
   card.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function closeEditor(ed, entry) {
+function unbindKeys(ed) {
   document.removeEventListener("keydown", ed.onKey);
+  document.removeEventListener("keyup", ed.onKey);
+}
+
+function closeEditor(ed, entry) {
+  unbindKeys(ed);
   state.editing = null;
   const fresh = ladderCard(entry || ed.l);
   ed.card.replaceWith(fresh);
@@ -193,17 +195,14 @@ function outOfOrder(pos) {
 const massOf = (index) => Math.floor((index - 1) / 2);
 const isManual = (ed, i) => (i in ed.picks) && ed.picks[i] !== null;
 
-function snapTo(ed, index, time) {
-  const m = massOf(index), rt = ed.t.rt, y = ed.t.traces[m].intensity;
-  const apex = climbUphill(ed.smooth[m], nearestScan(rt, time));
-  // the reported apex comes from the raw trace near the smoothed top, as on the server
-  const half = Math.max(1, ed.t.smooth_window);
-  let best = apex;
-  for (let i = Math.max(0, apex - half); i < Math.min(y.length, apex + half + 1); i++) {
-    if (y[i] > y[best]) best = i;
-  }
-  return best;
+/* The scan a click at `time` puts `index` on: the top of the raw peak under the
+   click, or with `exact` the clicked scan itself. */
+function snapTo(ed, index, time, exact) {
+  const rt = ed.t.rt, start = nearestScan(rt, time);
+  return exact ? start : climbUphill(ed.t.traces[massOf(index)].intensity, start);
 }
+
+const forget = (ed, i) => { delete ed.picks[i]; ed.exact.delete(i); };
 
 function renderAll(ed) { renderList(ed); render(ed); }
 
@@ -221,7 +220,7 @@ function renderList(ed) {
       <i style="background:${LADDER_COLORS[m % 8]}"></i>
       <span class="idx">${i}</span>
       <span class="rt">${absent ? "no peak" : pos[i] !== undefined ? pos[i].toFixed(2) : "—"}</span>
-      <span class="mark">${isManual(ed, i) ? "◆" : ""}</span>
+      <span class="mark">${isManual(ed, i) ? (ed.exact.has(i) ? "◇" : "◆") : ""}</span>
       <button type="button" class="pe-x" title="${absent ? "Use a peak for this index again"
         : "This index has no peak"}">${absent ? "+" : "×"}</button>
       <button type="button" class="pe-x" title="Back to the automatic peak"
@@ -231,14 +230,15 @@ function renderList(ed) {
     const [absentBtn, autoBtn] = row.querySelectorAll("button");
     absentBtn.onclick = (ev) => {
       ev.stopPropagation();
-      if (absent) delete ed.picks[i]; else ed.picks[i] = null;
+      forget(ed, i);
+      if (!absent) ed.picks[i] = null;
       status(ed, absent ? `Index ${i} uses its automatic peak again`
                         : `Index ${i} marked as having no peak`);
       renderAll(ed);
     };
     autoBtn.onclick = (ev) => {
       ev.stopPropagation();
-      delete ed.picks[i];
+      forget(ed, i);
       status(ed, `Index ${i} back to its automatic peak`);
       renderAll(ed);
     };
@@ -248,7 +248,7 @@ function renderList(ed) {
   const hint = ed.card.querySelector("[data-role=hint]");
   if (ed.active) {
     hint.innerHTML = `Placing <b>index ${ed.active}</b> on m/z ${ed.t.traces[massOf(ed.active)].mass}.
-      Click its peak. Drag to zoom. Esc to stop.`;
+      Click its peak; Shift-click to place it exactly. Drag to zoom. Esc to stop.`;
   } else {
     const first = [...bad][0];
     hint.innerHTML = first
@@ -368,10 +368,12 @@ function render(ed) {
       parts.push(`<text x="${Math.min(ed.hoverX + 6, W - R - 70)}" y="${T - 8}"
         class="pe-readout">${time.toFixed(2)} min</text>`);
       if (ed.active) {
-        const s = snapTo(ed, ed.active, time), y = ed.t.traces[activeMass].intensity[s];
+        const s = snapTo(ed, ed.active, time, ed.shift);
+        const y = ed.t.traces[activeMass].intensity[s];
         g.push(`<circle cx="${sx(rt[s])}" cy="${sy(y)}" r="5.5" class="pe-snap"/>`);
         parts.push(`<text x="${W - R}" y="${T - 8}" text-anchor="end" class="pe-readout">
-          click puts index ${ed.active} at ${rt[s].toFixed(2)} min</text>`);
+          ${ed.shift ? "shift-click puts" : "click puts"} index ${ed.active}
+          at ${rt[s].toFixed(2)} min${ed.shift ? " exactly" : ""}</text>`);
       }
     }
   }
@@ -401,6 +403,7 @@ function bindPointer(ed) {
   });
   svg.addEventListener("pointermove", (ev) => {
     const x = svgX(ed, ev);
+    ed.shift = ev.shiftKey;
     ed.hoverX = x >= PE.L && x <= ed.W - PE.R ? x : null;
     if (ed.drag) {
       ed.drag.now = x;
@@ -419,11 +422,11 @@ function bindPointer(ed) {
       render(ed);
       return;
     }
-    clickAt(ed, d.start, d.y);
+    clickAt(ed, d.start, d.y, ev.shiftKey);
   });
 }
 
-function clickAt(ed, x, y) {
+function clickAt(ed, x, y, exact) {
   // clicking a number on the chart chooses that index
   const hit = (ed.markers || [])
     .map(mk => ({ mk, d: Math.hypot(mk.px - x, mk.py - y) }))
@@ -434,13 +437,16 @@ function clickAt(ed, x, y) {
     return;
   }
   if (!ed.active || x < PE.L || x > ed.W - PE.R) return;
-  const s = snapTo(ed, ed.active, ed.invX(x));
+  const s = snapTo(ed, ed.active, ed.invX(x), exact);
   const time = ed.t.rt[s], i = ed.active;
   const auto = ed.l.auto_peaks ? ed.l.auto_peaks[i] : undefined;
+  forget(ed, i);
   // landing back on the automatic peak is not a hand placement
-  if (auto !== undefined && Math.abs(auto - time) < 1e-4) delete ed.picks[i];
-  else ed.picks[i] = Math.round(time * 1e5) / 1e5;
-  status(ed, `Index ${i} at ${time.toFixed(2)} min (not saved yet)`);
+  if (exact || auto === undefined || Math.abs(auto - time) >= 1e-4) {
+    ed.picks[i] = Math.round(time * 1e5) / 1e5;
+    if (exact) ed.exact.add(i);
+  }
+  status(ed, `Index ${i} at ${time.toFixed(2)} min${exact ? ", exactly" : ""} (not saved yet)`);
   renderAll(ed);
 }
 
@@ -456,10 +462,12 @@ function savePeaks(ed) {
   status(ed, "Saving and re-plotting…");
   fetch("/api/ladder/peaks", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: ed.l.name, picks: ed.picks }),
+    body: JSON.stringify({ name: ed.l.name, picks: Object.fromEntries(
+      Object.entries(ed.picks).map(([k, v]) =>
+        [k, v !== null && ed.exact.has(Number(k)) ? { rt: v, exact: true } : v])) }),
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
-    document.removeEventListener("keydown", ed.onKey);
+    unbindKeys(ed);
     state.editing = null;
     replaceLadder(ed.card, d, `Peaks saved; ticks reset`);
   }).catch(e => {

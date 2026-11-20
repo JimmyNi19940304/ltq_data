@@ -110,6 +110,23 @@ def config():
 
 
 # ----------------------------------------------------------------- page 1
+def parse_pick(value):
+    """A hand-made choice for one index, from JSON.
+
+    None means the index has no peak; a number is a time to snap to the top of
+    the peak it lies on; {"rt": minutes, "exact": true} is a peak put on that
+    scan without snapping. Raises ValueError for anything else.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        rt = float(value.get("rt"))
+        return {"rt": rt, "exact": True} if value.get("exact") else rt
+    if isinstance(value, bool):
+        raise ValueError(value)
+    return float(value)
+
+
 def overrides_path() -> Path:
     return CONFIG_PATH.parent / OVERRIDES_FILENAME
 
@@ -145,7 +162,7 @@ def load_overrides() -> dict:
                 peaks = {}
                 for k, v in value["peaks"].items():
                     try:
-                        peaks[int(k)] = None if v is None else float(v)
+                        peaks[int(k)] = parse_pick(v)
                     except (TypeError, ValueError):
                         continue
                 entry["peaks"] = peaks
@@ -226,6 +243,9 @@ def analyse_one(path: Path, position: int, cfg, rt_max, manual=None, progress=No
                   for tr in ladder.traces for pk in tr["peaks"]},
         "manual": {int(pk.index): round(float(pk.rt), 5)
                    for tr in ladder.traces for pk in tr["peaks"] if pk.manual},
+        # hand-placed on the clicked scan, without snapping to a peak top
+        "exact": sorted(int(pk.index) for tr in ladder.traces for pk in tr["peaks"]
+                        if pk.exact),
         "auto_peaks": {int(k): round(float(v), 5) for k, v in ladder.auto_rt.items()},
         "absent": ladder.absent,
         "dropped": ladder.dropped,
@@ -242,7 +262,9 @@ def analyse_one(path: Path, position: int, cfg, rt_max, manual=None, progress=No
 
 def _saved_picks(entry):
     """The hand-made choices worth keeping: placed peaks and missing marks."""
-    picks = {int(k): v for k, v in entry["manual"].items()}
+    exact = {int(i) for i in entry.get("exact", [])}
+    picks = {int(k): ({"rt": v, "exact": True} if int(k) in exact else v)
+             for k, v in entry["manual"].items()}
     picks.update({int(i): None for i in entry["absent"]})
     return picks
 
@@ -393,7 +415,7 @@ def set_ladder_peaks():
             picks[i] = None
             continue
         try:
-            picks[i] = float(value)
+            picks[i] = parse_pick(value)
         except (TypeError, ValueError):
             return jsonify({"error": f"'{value}' is not a retention time."}), 400
 

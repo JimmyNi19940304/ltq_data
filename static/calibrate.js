@@ -264,7 +264,9 @@ function buildIndexList(card, l) {
     row.innerHTML = `<input type="checkbox" ${chosen.has(i) ? "checked" : ""}>
       <span class="idx">${i}</span><span class="rt">${l.peaks[i].toFixed(2)}</span>
       ${l.manual && l.manual[i] !== undefined
-        ? '<span class="by-hand" title="placed by hand">◆</span>' : ""}`;
+        ? ((l.exact || []).includes(i)
+          ? '<span class="by-hand" title="placed exactly by hand (Shift-click)">◇</span>'
+          : '<span class="by-hand" title="placed by hand">◆</span>') : ""}`;
     row.querySelector("input").onchange = (ev) => {
       const set = new Set(state.selections[l.name]);
       ev.target.checked ? set.add(i) : set.delete(i);
