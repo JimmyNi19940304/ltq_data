@@ -109,7 +109,7 @@ function scan() {
 
 function showLadders(d) {
   state.ladders = d.ladders;
-  state.editing = null;     // a reload replaces every card, open editor included
+  resetPeakEditor();     // a reload replaces every card, open editor included
   const box = $("ladder-list");
   box.innerHTML = "";
   const warnings = [];
@@ -194,7 +194,8 @@ function ladderCard(l) {
     };
     const reset = card.querySelector("[data-role=rt-max-reset]");
     if (reset) reset.onclick = () => applyRtMax(l.name, null);
-    card.querySelector("[data-role=edit-peaks]").onclick = () => openPeakEditor(l.name);
+    card.querySelector("[data-role=edit-peaks]").onclick = () =>
+      openPeakEditor(card, l, editorOptions(l.name));
     buildIndexList(card, l);
     return card;
 }
@@ -240,6 +241,21 @@ function replaceLadder(card, d, message) {
   const s = fresh.querySelector("[data-role=rt-max-status]");
   if (s) s.textContent = message;
   return fresh;
+}
+
+/* What the shared peak editor needs from this page. */
+function editorOptions(name) {
+  const post = (url, body) => fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then(r => r.json());
+  return {
+    traces: () => fetch("/api/ladder/traces?name=" + encodeURIComponent(name)).then(r => r.json()),
+    save: (picks) => post("/api/ladder/peaks", { name, picks }),
+    rebuild: (l) => ladderCard(l),
+    onSaved: (card, d) => replaceLadder(card, d, "Peaks saved; ticks reset"),
+    alert: showAlert,
+  };
 }
 
 const cardId = (name) => name.replace(/[^A-Za-z0-9_-]/g, "_");

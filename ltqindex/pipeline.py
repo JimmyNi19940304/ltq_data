@@ -14,9 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 from .analysis import Compound, Params, analyse_ladder, DEFAULT_LADDER_MASSES
+from .calibration import calibrate
+from .ladderedit import (ladder_entry, load_overrides, parse_picks, parse_rt_max,
+                         saved_picks, store_override, with_rt_max)
 from .msdata import load_run
 from .standards import StandardError_, build_transform, compound_output_dir, load_standard
-from .plotting import plot_compound, plot_ladder, plot_spectrum
+from .plotting import plot_compound, plot_fit, plot_ladder, plot_spectrum
 
 EXPORT_FORMATS = ("png", "pdf")
 
@@ -64,9 +67,15 @@ class Job:
 
 
 class Session:
-    """Holds the uploaded files, the analysis results and the generated figures."""
+    """Holds the uploaded files, the analysis results and the generated figures.
 
-    def __init__(self, root: Path):
+    The work runs in the order the operator sees it: the standard ladder is read,
+    this run's own ladder is peak-picked and corrected by hand (step 2), it is
+    fitted onto the standard with the indexes ticked there, and only then are the
+    compounds read and placed on the standard's time axis (step 3 onwards).
+    """
+
+    def __init__(self, root: Path, overrides_folder=None):
         self.id = uuid.uuid4().hex[:12]
         self.root = Path(root) / self.id
         self.uploads = self.root / "uploads"
@@ -77,11 +86,20 @@ class Session:
             d.mkdir(parents=True, exist_ok=True)
 
         self.ladder_path = None
+        self.ladder_file = ""         # the ladder's own file name: the key for hand edits
         self.ladder_name = ""
         self.ladder_masses = list(DEFAULT_LADDER_MASSES)
-        self.ladder_limit = None      # None = calibrate with every ladder index
         self.ladder_dir = None        # from config.json; locates standard_ladder/
-        self.transform_model = "quadratic"
+        # ladder_overrides.json lives here, shared with the calibration app
+        self.overrides_folder = overrides_folder
+        self.ladder_rt_max = None     # this ladder's own limit; None = params.rt_max
+        self.ladder_picks = {}        # index -> hand-placed pick, or None for "no peak"
+        self.selected_indexes = None  # ticked on the ladder page; None = all
+        self.ladder_run = None
+        self.ladder_entry = None      # what the ladder page draws
+        self.fit = None               # every model's fit, for the ladder page
+        self.fit_figure = None
+        self.transform_model = "cubic"
         self.standard = None          # the saved standard ladder record
         self.transform = None         # this run's ladder onto that standard
         self.transform_error = None
@@ -95,10 +113,9 @@ class Session:
         self.confirmed = False
         self.lock = threading.Lock()
 
-    def _build_transform(self, job: Job):
-        """Fit this run's ladder onto the saved standard, if there is one."""
+    # ------------------------------------------------------- standard ladder
+    def _load_standard(self):
         self.standard = None
-        self.transform = None
         self.transform_error = None
         if not self.ladder_dir:
             self.transform_error = (
@@ -116,22 +133,191 @@ class Session:
                 "No standard ladder has been saved yet. Save one in the calibration "
                 "app to put compounds on a common time axis."
             )
-            return
 
-        local = {int(pk.index): pk.rt for tr in self.ladder.traces for pk in tr["peaks"]}
-        # the ladder range chosen on the review page also bounds the transform: an
-        # index judged unreliable there should not quietly feed the fit
-        allowed = ([i for i in local if i <= self.ladder.limit]
-                   if self.ladder.limit < self.ladder.n_points else None)
-        try:
-            self.transform = build_transform(local, self.standard,
-                                             model=self.transform_model, indexes=allowed)
-        except StandardError_ as exc:
-            self.transform_error = str(exc)
-            return
-        job.update(
-            f"Fitted a {self.transform_model} transform onto {self.standard['name']}", 0.78
+    # ----------------------------------------------------------- ladder page
+    def run_ladder(self, job: Job):
+        with self.lock:
+            self._run_ladder(job)
+
+    def _run_ladder(self, job: Job):
+        job.update("Reading the standard ladder", 0.02, "ladder")
+        self._load_standard()
+
+        # start from whatever was set for this ladder file before, in either app
+        if self.overrides_folder and self.ladder_file:
+            saved = load_overrides(self.overrides_folder).get(self.ladder_file, {})
+            self.ladder_rt_max = saved.get("rt_max")
+            self.ladder_picks = dict(saved.get("peaks") or {})
+
+        job.update("Reading the ladder file", 0.05, "ladder")
+        self.ladder_run = load_run(
+            self.ladder_path, self.cache, progress=lambda m: job.update(m, 0.5),
         )
+        self.ladder_name = self.ladder_run.source_name
+        job.update("Extracting ladder ion traces", 0.9, "ladder")
+        try:
+            self._analyse_ladder()
+        except ValueError:
+            if self.ladder_rt_max is None:
+                raise
+            # a saved limit that no longer works should not block the run
+            self.ladder_rt_max = None
+            self._analyse_ladder()
+        job.update("Ladder ready for review", 1.0, "ladder_review")
+        job.done = True
+
+    @property
+    def ladder_rt_limit(self):
+        return self.ladder_rt_max if self.ladder_rt_max is not None else self.params.rt_max
+
+    def _analyse_ladder(self):
+        """Peak-pick this run's ladder with its own limit and hand placements.
+
+        Indexes are numbered by their place in the full ladder, so one marked as
+        having no peak leaves a gap rather than renumbering the rest. Any fit made
+        before is dropped: it was made on the old peaks.
+        """
+        params = with_rt_max(self.params, self.ladder_rt_limit)
+        self.ladder = analyse_ladder(self.ladder_run, self.ladder_masses, params,
+                                     manual=self.ladder_picks, fixed_slots=True)
+        self._plot_ladder()
+        present = set(int(k) for k in self.ladder_entry["peaks"])
+        if self.selected_indexes is not None:
+            self.selected_indexes = sorted(set(self.selected_indexes) & present)
+        self.fit = None
+        self.fit_figure = None
+        self.transform = None
+        self.compounds = []
+
+    def _plot_ladder(self):
+        for f in self.figures.glob("ladder_*"):
+            f.unlink()
+        stem = self.figures / f"ladder_{safe_name(self.ladder_name)}_{int(time.time() * 1000)}"
+        plot_ladder(self.ladder, self.ladder_name, stem, formats=("png",))
+        self.ladder_entry = ladder_entry(
+            self.ladder, name=self.ladder_name, file=self.ladder_file,
+            figure=stem.name + ".png", rt_max=self.ladder_rt_limit,
+            default_rt_max=self.params.rt_max, masses=self.ladder_masses,
+        )
+
+    def _remember_ladder(self):
+        if self.overrides_folder and self.ladder_file:
+            store_override(self.overrides_folder, self.ladder_file,
+                           rt_max=self.ladder_rt_limit, default_rt_max=self.params.rt_max,
+                           peaks=saved_picks(self.ladder_entry))
+
+    def set_ladder_rt_max(self, value):
+        """Raises ValueError with a message for the operator."""
+        with self.lock:
+            rt_max = parse_rt_max(value, self.params.rt_max)
+            before = (self.ladder_rt_max, self.ladder_picks)
+            self.ladder_rt_max = None if rt_max == self.params.rt_max else rt_max
+            self.ladder_picks = saved_picks(self.ladder_entry)
+            try:
+                self._analyse_ladder()
+            except ValueError:
+                self.ladder_rt_max, self.ladder_picks = before
+                raise
+            # a hand-placed peak now past the limit is let go
+            self.ladder_picks = saved_picks(self.ladder_entry)
+            self._remember_ladder()
+
+    def set_ladder_picks(self, raw):
+        """Raises ValueError with a message for the operator."""
+        with self.lock:
+            picks = parse_picks(raw, 2 * len(self.ladder_masses))
+            before = self.ladder_picks
+            self.ladder_picks = picks
+            self._analyse_ladder()
+            if self.ladder.dropped:
+                dropped = self.ladder.dropped
+                self.ladder_picks = before
+                self._analyse_ladder()
+                raise ValueError("Index " + ", ".join(map(str, dropped))
+                                 + " was placed past the retention time limit.")
+            self._remember_ladder()
+
+    def ladder_page(self):
+        """Everything step 2 draws: the ladder, the standard, and the fit if made."""
+        std = self.standard
+        usable = (sorted(int(i) for i in (std.get("usable_indexes") or std["peaks"]))
+                  if std else [])
+        present = sorted(int(k) for k in self.ladder_entry["peaks"])
+        selected = (self.selected_indexes if self.selected_indexes is not None
+                    else [i for i in present if not std or i in usable])
+        return {
+            "ladder": self.ladder_entry,
+            "selected": selected,
+            "standard": ({
+                "name": std["name"],
+                "saved_at": std.get("saved_at"),
+                "peaks": {int(k): v for k, v in std["peaks"].items()},
+                "usable_indexes": usable,
+            } if std else None),
+            "standard_error": self.transform_error if not std else None,
+            "model": self.transform_model,
+            "fit": self.fit_payload(),
+        }
+
+    def fit_ladder(self, model, indexes):
+        """Fit this run's ladder onto the standard with the ticked indexes.
+
+        Every model is fitted so they can be compared; `model` is the one the
+        compounds will be put through. Raises ValueError with a message.
+        """
+        with self.lock:
+            if self.standard is None:
+                raise ValueError(self.transform_error or "No standard ladder to fit onto.")
+            local = {int(k): float(v) for k, v in self.ladder_entry["peaks"].items()}
+            selected = sorted({int(i) for i in indexes} & set(local))
+            std_peaks = {int(k): float(v) for k, v in self.standard["peaks"].items()}
+            usable = {int(i) for i in (self.standard.get("usable_indexes") or std_peaks)}
+            chosen = sorted(set(selected) & usable & set(std_peaks))
+
+            fit = calibrate(std_peaks, local, indexes=chosen)
+            try:
+                transform = build_transform(local, self.standard, model=model,
+                                            indexes=selected)
+            except StandardError_ as exc:
+                raise ValueError(str(exc)) from None
+
+            self.transform_model = model
+            self.selected_indexes = selected
+            self.ladder.excluded = set(local) - set(selected)
+            self._plot_ladder()           # unticked indexes are greyed on the figure
+            self.fit = fit
+            self.transform = transform
+            self.compounds = []
+            for f in self.figures.glob("fit_*"):
+                f.unlink()
+            stem = self.figures / f"fit_{model}_{int(time.time() * 1000)}"
+            plot_fit(fit, model, self.ladder_name, self.standard["name"], stem)
+            self.fit_figure = stem.name + ".png"
+
+    def fit_payload(self):
+        if not self.fit or not self.transform:
+            return None
+        t = self.transform
+        span = (float(self.ladder.traces[0]["rt"][0]), float(self.ladder.traces[0]["rt"][-1]))
+        mono = t.check_monotonic(*span)
+        return {
+            "model": t.model,
+            "figure": self.fit_figure,
+            "transform": t.to_dict(),
+            "monotonic": mono,
+            "models": [
+                {k: m[k] for k in ("key", "label", "equation", "rmse", "std_error",
+                                   "max_abs_residual", "r2", "adjusted_r2", "exact")}
+                for m in self.fit.get("models", [])
+            ],
+            "uncalibrated": self.fit.get("uncalibrated"),
+            "suggested": self.fit.get("best"),
+            "excluded_by_standard": sorted(
+                set(self.selected_indexes or [])
+                - {int(i) for i in (self.standard.get("usable_indexes")
+                                    or self.standard["peaks"])}),
+            "error": self.fit.get("error"),
+        }
 
     # ------------------------------------------------------------- analysis
     def run_chromatograms(self, job: Job):
@@ -141,28 +327,19 @@ class Session:
             self._run_chromatograms(job)
 
     def _run_chromatograms(self, job: Job):
-        job.update("Reading the ladder file", 0.02, "chromatograms")
-        n_files = 1 + len(self.compound_specs)
-        step = 0.72 / max(1, n_files)
-
-        ladder_run = load_run(
-            self.ladder_path, self.cache,
-            progress=lambda m: job.update(m, min(0.02 + step * 0.8, 0.74)),
-        )
-        self.ladder_name = ladder_run.source_name
-        job.update("Extracting ladder ion traces", 0.02 + step, "chromatograms")
-        self.ladder = analyse_ladder(
-            ladder_run, self.ladder_masses, self.params, limit=self.ladder_limit
-        )
-
-        self._build_transform(job)
+        """Read every compound and put it through the fit made on the ladder page."""
+        if self.ladder is None:
+            raise ValueError("Read the ladder first.")
+        n_files = len(self.compound_specs)
+        step = 0.76 / max(1, n_files)
 
         self.compounds = []
-        for i, spec in enumerate(self.compound_specs, start=1):
+        for i, spec in enumerate(self.compound_specs):
             base = 0.02 + step * i
+            job.update(f"Reading {spec['name']}", base, "chromatograms")
             run = load_run(
                 spec["path"], self.cache,
-                progress=lambda m, b=base: job.update(m, min(b + step * 0.8, 0.74)),
+                progress=lambda m, b=base: job.update(m, min(b + step * 0.8, 0.78)),
             )
             job.update(f"Building the MS2 chromatogram for {spec['name']}", base + step * 0.9)
             compound = Compound(run, spec["name"], spec["nominal_mass"], self.params, self.ladder)
@@ -173,17 +350,6 @@ class Session:
         self.chromatogram_figures = []
         for f in self.figures.glob("chrom_*"):
             f.unlink()
-
-        stem = self.figures / f"chrom_ladder_{safe_name(self.ladder_name)}"
-        plot_ladder(self.ladder, self.ladder_name, stem, formats=("png",))
-        self.chromatogram_figures.append(
-            {
-                "key": stem.name,
-                "title": f"Ladder chromatogram \u2014 {self.ladder_name}",
-                "kind": "ladder",
-                "file": stem.name + ".png",
-            }
-        )
         for c in self.compounds:
             cstem = self.figures / f"chrom_compound_{safe_name(c.name)}"
             plot_compound(c, cstem, formats=("png",))
@@ -317,6 +483,10 @@ class Session:
         plot_ladder(self.ladder, self.ladder_name,
                     out / "chromatograms" / f"ladder_{safe_name(self.ladder_name)}",
                     formats=EXPORT_FORMATS)
+        if self.fit and self.transform:
+            plot_fit(self.fit, self.transform.model, self.ladder_name,
+                     self.standard["name"], out / "chromatograms" / "ladder_fit",
+                     formats=EXPORT_FORMATS)
         for c in self.compounds:
             plot_compound(c, out / "chromatograms" / f"chromatogram_{safe_name(c.name)}",
                           formats=EXPORT_FORMATS)

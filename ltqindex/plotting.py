@@ -105,7 +105,7 @@ def plot_ladder(ladder, run_name, path=None, formats=("png",)):
                 offsets[j] = 21
         for pk, dy in zip(tr["peaks"], offsets):
             y = pk.height / scale
-            calibrating = int(pk.index) <= ladder.limit
+            calibrating = ladder.uses(pk.index)
             ax.annotate(f"{int(pk.index)}", xy=(pk.rt, y), xytext=(0, dy),
                         textcoords="offset points", ha="center", fontsize=8.5,
                         fontweight="600" if calibrating else "400",
@@ -126,6 +126,10 @@ def plot_ladder(ladder, run_name, path=None, formats=("png",)):
     absent = getattr(ladder, "absent", [])
     if absent:
         subtitle += "   |   no peak for index " + ", ".join(str(i) for i in absent)
+    excluded = sorted(getattr(ladder, "excluded", ()))
+    if excluded:
+        subtitle += ("   |   index " + ", ".join(str(i) for i in excluded)
+                     + " not used, greyed out")
     if ladder.limit < ladder.max_index:
         subtitle += (
             f"   |   only index 1\u2013{ladder.limit} used for calibration, "
@@ -238,5 +242,75 @@ def plot_spectrum(spec, params: Params, path=None, formats=("png",)):
         f"({spec['n_scans']} scans)   |   index {idx_text}",
     )
     written = _finish(fig, ax, path, formats)
+    plt.close(fig)
+    return written
+
+
+def plot_fit(fit, model_key, run_name, standard_name, path=None, formats=("png",)):
+    """This run's ladder retention times (x) against the standard's (y), with the
+    chosen model's curve through the indexes used and its residuals underneath.
+
+    `fit` is the result of calibration.calibrate(): points carry index, x, y and
+    whether they were used; models carry the curve and residuals.
+    """
+    import numpy as np
+
+    model = next((m for m in fit.get("models", []) if m["key"] == model_key), None)
+    fig, (ax, rax) = plt.subplots(
+        2, 1, figsize=(8.6, 6.4), sharex=True,
+        gridspec_kw={"height_ratios": [3, 1.15], "hspace": 0.08},
+    )
+    pts = fit.get("points", [])
+    xs = [p["x"] for p in pts] or [0.0, 1.0]
+    lo, hi = min(xs), max(xs)
+    pad = 0.05 * (hi - lo or 1.0)
+
+    ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], ls=(0, (4, 3)), lw=0.8,
+            color=HAIRLINE, zorder=1, label="y = x (no shift)")
+    if model:
+        cx, cy = zip(*model["curve"])
+        ax.plot(cx, cy, lw=1.6, color=COMPOUND, zorder=2, label=f"{model['label']} fit")
+    for p in pts:
+        used = p["used"]
+        ax.plot([p["x"]], [p["y"]], marker="o", ms=5.5,
+                color=MARK if used else "white", mec=MARK if used else MUTED,
+                mew=1.0, zorder=3)
+        ax.annotate(str(p["index"]), xy=(p["x"], p["y"]), xytext=(-6, 6),
+                    textcoords="offset points", ha="right", fontsize=8,
+                    color=INK if used else MUTED)
+    ax.set_ylabel(f"Standard RT (min)")
+    ax.legend(loc="upper left", fontsize=8)
+
+    if model:
+        res = {int(k): v for k, v in model["residuals"].items()}
+        used = [p for p in pts if p["index"] in res]
+        rax.axhline(0, color=HAIRLINE, lw=0.8)
+        rax.vlines([p["x"] for p in used], 0, [res[p["index"]] for p in used],
+                   color=MARK, lw=1.2)
+        rax.plot([p["x"] for p in used], [res[p["index"]] for p in used], "o",
+                 ms=4, color=MARK)
+        span = max([abs(v) for v in res.values()] + [1e-3])
+        rax.set_ylim(-span * 1.4, span * 1.4)
+    rax.set_ylabel("Residual (min)")
+    rax.set_xlabel(f"{run_name} RT (min)")
+    rax.set_xlim(lo - pad, hi + pad)
+    for a in (ax, rax):
+        a.spines["top"].set_visible(False)
+        a.spines["right"].set_visible(False)
+
+    if model:
+        subtitle = (f"{model['equation']}   |   RMSE {model['rmse']:.4f} min   |   "
+                    f"{len(model['residuals'])} indexes used; hollow points left out")
+    else:
+        subtitle = fit.get("error") or "no fit"
+    _header(ax, f"Ladder fit \u2014 {run_name} onto {standard_name}", subtitle)
+    written = []
+    if path is not None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for ext in formats:
+            out = path.parent / f"{path.name}.{ext}"
+            fig.savefig(out, dpi=200 if ext == "png" else None, bbox_inches="tight")
+            written.append(out)
     plt.close(fig)
     return written

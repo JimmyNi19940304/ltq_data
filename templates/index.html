@@ -8,6 +8,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/ladder.css">
 </head>
 <body>
 
@@ -26,9 +27,10 @@
 
   <ol class="rail" id="rail">
     <li data-step="1"><span>1</span>Input data</li>
-    <li data-step="2"><span>2</span>Chromatograms</li>
-    <li data-step="3"><span>3</span>Mass spectra</li>
-    <li data-step="4"><span>4</span>Download</li>
+    <li data-step="2"><span>2</span>Ladder and fit</li>
+    <li data-step="3"><span>3</span>Chromatograms</li>
+    <li data-step="4"><span>4</span>Mass spectra</li>
+    <li data-step="5"><span>5</span>Download</li>
   </ol>
 
   <div class="alert hidden" id="alert"></div>
@@ -67,16 +69,11 @@
         </section>
 
         <section class="card" id="standard-card">
-          <h3>Standard time axis</h3>
+          <h3>Standard ladder</h3>
           <p class="note" id="standard-line">Checking for a saved standard ladder…</p>
-          <label class="field" id="model-field"><span>Transform onto the standard</span>
-            <select name="transform_model" id="transform-model">
-              <option value="linear">Linear &mdash; ax + b</option>
-              <option value="quadratic" selected>Quadratic &mdash; ax&sup2; + bx + c</option>
-              <option value="cubic">Cubic &mdash; ax&sup3; + bx&sup2; + cx + d</option>
-            </select>
-            <em>The ladder above is fitted onto the saved standard with this model, and
-            the same transform is applied to every compound in this run.</em></label>
+          <p class="note mono" id="standard-path"></p>
+          <p class="note">Chosen and corrected in the calibration app. The ladder on
+          the left is fitted onto it in the next step.</p>
         </section>
 
         <section class="card">
@@ -88,6 +85,17 @@
           <p class="note">Up to five. Each needs a name, a nominal mass and a file.</p>
         </section>
       </div>
+
+      <section class="card hidden" id="standard-view">
+        <div class="card-head">
+          <h3 id="standard-view-title">Standard ladder chromatogram</h3>
+          <button type="button" class="ghost small" id="standard-toggle">Show chromatogram</button>
+        </div>
+        <div class="standard-figure hidden" id="standard-figure"></div>
+        <div class="std-chips" id="standard-chips"></div>
+        <p class="note">Indexes with a dashed outline were unticked when the standard
+        was saved and are never used for fitting.</p>
+      </section>
 
       <details class="card settings">
         <summary>Peak-finding settings</summary>
@@ -127,23 +135,49 @@
   <!-- ======================= step 2 ======================= -->
   <section class="panel step hidden" id="step-2">
     <div class="panel-head">
+      <h2>Ladder and fit</h2>
+      <p id="ladder-caption"></p>
+    </div>
+
+    <div id="ladder-slot"></div>
+
+    <section class="card fit-card" id="fit-card">
+      <h3>Fit onto the standard ladder</h3>
+      <p class="note" id="fit-line"></p>
+      <div class="fit-row" id="fit-controls">
+        <label class="field inline"><span>Model</span>
+          <select id="fit-model">
+            <option value="linear">Linear &mdash; ax + b</option>
+            <option value="quadratic">Quadratic &mdash; ax&sup2; + bx + c</option>
+            <option value="cubic" selected>Cubic &mdash; ax&sup3; + bx&sup2; + cx + d</option>
+          </select></label>
+        <button type="button" class="primary" id="run-fit">Fit with the ticked indexes</button>
+        <span class="note" id="fit-status"></span>
+      </div>
+      <div id="fit-result"></div>
+    </section>
+
+    <div class="gate">
+      <div>
+        <h3>Are the ladder peaks and the fit right?</h3>
+        <p>Every compound is put on the standard's time axis through this fit.</p>
+      </div>
+      <div class="gate-buttons">
+        <button type="button" class="ghost" id="back-to-input">Back to input</button>
+        <button type="button" class="primary" id="to-compounds" disabled>Yes, read the compounds</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= step 3 ======================= -->
+  <section class="panel step hidden" id="step-3">
+    <div class="panel-head">
       <h2>Chromatograms</h2>
       <p id="chrom-caption"></p>
     </div>
 
     <div id="ruler-wrap"></div>
     <div id="chrom-figures"></div>
-
-    <section class="card calib">
-      <h3>Ladder range used for calibration</h3>
-      <p class="note">Compound indices are interpolated between these ladder peaks.
-      Trim the top of the ladder if its last peaks are weak or poorly resolved.</p>
-      <div class="calib-row">
-        <label class="field inline"><span>Use ladder index up to</span>
-          <select id="ladder-limit" class="mono"></select></label>
-        <button type="button" class="ghost" id="apply-limit">Apply and replot</button>
-      </div>
-    </section>
 
     <div id="index-table"></div>
 
@@ -159,8 +193,8 @@
     </div>
   </section>
 
-  <!-- ======================= step 3 ======================= -->
-  <section class="panel step hidden" id="step-3">
+  <!-- ======================= step 4 ======================= -->
+  <section class="panel step hidden" id="step-4">
     <div class="panel-head">
       <h2>Mass spectra</h2>
       <p id="spec-caption"></p>
@@ -172,8 +206,8 @@
     </div>
   </section>
 
-  <!-- ======================= step 4 ======================= -->
-  <section class="panel step hidden" id="step-4">
+  <!-- ======================= step 5 ======================= -->
+  <section class="panel step hidden" id="step-5">
     <div class="panel-head">
       <h2>Download</h2>
       <p>Everything you just approved, as files you can keep.</p>
@@ -196,5 +230,6 @@
 
 <div class="lightbox hidden" id="lightbox"><img alt="" id="lightbox-img"></div>
 <script src="/static/app.js"></script>
+<script src="/static/peak_editor.js"></script>
 </body>
 </html>

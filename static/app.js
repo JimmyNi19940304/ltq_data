@@ -15,9 +15,10 @@ fetch("/api/health").then(r => r.json()).then(h => {
     const when = String(h.standard.saved_at || "").replace("T", " ").slice(0, 16);
     line.innerHTML = `Compounds will be placed on <b>${escapeHtml(h.standard.name)}</b>'s
       time axis (saved ${escapeHtml(when)}, ${h.standard.usable_indexes.length} usable indexes).`;
+    $("standard-path").textContent = h.standard.standard_file || "";
+    showStandard(h.standard);
   } else {
     card.classList.add("absent");
-    $("model-field").classList.add("hidden");
     line.textContent = (h.standard && h.standard.detail) ||
       "No standard ladder saved. Times will be the instrument's own.";
   }
@@ -31,13 +32,59 @@ fetch("/api/health").then(r => r.json()).then(h => {
   }
 }).catch(() => { $("parser-text").textContent = "Server not reachable"; });
 
+/* The saved standard ladder (procedure 1): read from standard_ladder/, shown
+   with its index table; the chromatogram is drawn on request since it means
+   reading the standard's own .raw file. */
+function showStandard(std) {
+  $("standard-view").classList.remove("hidden");
+  $("standard-view-title").textContent = `Standard ladder — ${std.name}`;
+  const usable = new Set((std.usable_indexes || []).map(Number));
+  const byHand = new Set((std.manual_indexes || []).map(Number));
+  const absent = new Set((std.absent_indexes || []).map(Number));
+  const total = (std.ladder_masses || []).length * 2 || 16;
+  let chips = "";
+  for (let i = 1; i <= total; i++) {
+    const rt = std.peaks[i];
+    if (rt === undefined) {
+      chips += `<span class="chip none" title="${absent.has(i) ? "marked as having no peak" : "no peak found"}">${i} —</span>`;
+    } else {
+      chips += `<span class="chip${usable.has(i) ? "" : " off"}"
+        title="${usable.has(i) ? "used for fitting" : "unticked on the standard"}">${i}
+        <em>${Number(rt).toFixed(2)}</em>${byHand.has(i) ? " ◆" : ""}</span>`;
+    }
+  }
+  $("standard-chips").innerHTML = chips;
+  $("standard-toggle").onclick = () => {
+    const box = $("standard-figure");
+    const opening = box.classList.contains("hidden");
+    box.classList.toggle("hidden", !opening);
+    $("standard-toggle").textContent = opening ? "Hide chromatogram" : "Show chromatogram";
+    if (!opening || box.dataset.loaded) return;
+    box.dataset.loaded = "1";
+    box.innerHTML = `<p class="note">Drawing the standard from its .raw file…</p>`;
+    fetch("/api/standard/figure?t=" + Date.now()).then(r => {
+      if (r.ok) return r.blob().then(b => {
+        box.innerHTML = "";
+        const img = document.createElement("img");
+        img.src = URL.createObjectURL(b);
+        img.alt = `Standard ladder ${std.name}`;
+        box.appendChild(img);
+      });
+      return r.json().then(d => { throw new Error(d.error || `Server returned ${r.status}`); });
+    }).catch(e => {
+      delete box.dataset.loaded;
+      box.innerHTML = `<p class="note">${escapeHtml(e.message)}</p>`;
+    });
+  };
+}
+
 /* ----------------------------------------------------------- step rail */
 function reach(n) {
   state.reached = Math.max(state.reached, n);
   paintRail(currentStep());
 }
 function currentStep() {
-  for (const n of [1, 2, 3, 4]) if (!$("step-" + n).classList.contains("hidden")) return n;
+  for (const n of [1, 2, 3, 4, 5]) if (!$("step-" + n).classList.contains("hidden")) return n;
   return null;
 }
 function paintRail(active) {
@@ -82,8 +129,8 @@ goStep(1);
 
 /* Moving to a step either shows what is already there, or builds it once. */
 function enterStep(n) {
-  if (n === 3 && !(state.spectraFresh && state.spectra.length)) return buildSpectra();
-  if (n === 4) fillManifest();
+  if (n === 4 && !(state.spectraFresh && state.spectra.length)) return buildSpectra();
+  if (n === 5) fillManifest();
   goStep(n);
 }
 
@@ -195,7 +242,6 @@ $("setup").onsubmit = (e) => {
     fd.append(`compound_mass_${i}`, b.querySelector('[data-role=mass]').value);
   });
   for (const el of form.querySelectorAll(".settings input")) fd.append(el.name, el.value);
-  fd.append("transform_model", $("transform-model").value);
 
   showWorking("Uploading", "Large .raw files take a moment. Giving a path instead skips the upload entirely.");
   const xhr = new XMLHttpRequest();
@@ -211,16 +257,267 @@ $("setup").onsubmit = (e) => {
       return showAlert("The run could not start", [data.error || `Server returned ${xhr.status}`]);
     }
     state.session = data.session;
-    $("working-title").textContent = "Reading scans";
+    $("working-title").textContent = "Reading the ladder";
     $("working-hint").textContent =
       "The first read of a .raw file takes roughly half a minute. The same file is reused after that.";
-    pollJob(data.job).then(loadChromatograms).catch(e => failed(e, 1));
+    pollJob(data.job).then(loadLadder).catch(e => failed(e, 1));
   };
   xhr.onerror = () => failed(new Error("Upload failed"), 1);
   xhr.send(fd);
 };
 
-/* ============================================== step 2: chromatograms */
+/* ============================================ step 2: ladder and fit */
+const api = (path) => `/api/session/${state.session}${path}`;
+const postJson = (path, body) => fetch(api(path), {
+  method: "POST", headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body || {}),
+}).then(r => r.json());
+
+function loadLadder() {
+  return fetch(api("/ladder")).then(r => r.json()).then(d => {
+    if (d.error) throw new Error(d.error);
+    showLadderPage(d);
+    state.reached = 2;
+    reach(2);
+    goStep(2);
+  });
+}
+
+/* Draw step 2 from the server's view of it. Anything after it is now stale. */
+function showLadderPage(d, message) {
+  resetPeakEditor();
+  state.ladderPage = d;
+  state.selected = (d.selected || []).map(Number);
+  state.compoundsFresh = false;
+  state.spectraFresh = false;
+  state.exportFresh = false;
+  state.reached = Math.min(state.reached, 2);
+  const l = d.ladder;
+  $("ladder-caption").innerHTML =
+    `Ladder <b>${escapeHtml(l.name)}</b>: ${l.n_peaks} of ${l.expected} peaks, numbered 1–${l.expected}
+     by ladder mass. Fix the peaks if needed, tick the indexes to fit with, then fit.`;
+  const slot = $("ladder-slot");
+  slot.innerHTML = "";
+  slot.appendChild(mainLadderCard(l));
+  if (message) slot.querySelector("[data-role=rt-max-status]").textContent = message;
+  if (d.model) $("fit-model").value = d.model;
+  renderFit(d);
+  showAlert("Worth checking", l.warnings || []);
+  paintRail(2);
+}
+
+function mainLadderCard(l) {
+  const d = state.ladderPage;
+  const usable = d.standard ? new Set(d.standard.usable_indexes.map(Number)) : null;
+  const card = document.createElement("div");
+  card.className = "ladder";
+  const badge = l.monotonic ? "" : `<span class="badge">retention times not increasing</span>`;
+  const custom = l.rt_max_custom ? `<span class="badge custom">own rt_max</span>` : "";
+  const warn = (l.warnings || []).length
+    ? `<ul class="card-warnings">${l.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join("")}</ul>` : "";
+  card.innerHTML = `
+    <div class="ladder-head">
+      <b>${escapeHtml(l.name)}</b>${badge}${custom}
+      <span class="meta" data-role="count"></span>
+    </div>
+    <div class="ladder-body">
+      <div class="ladder-plot">
+        <img src="${api("/figure/" + encodeURIComponent(l.figure))}?t=${Date.now()}" alt="${escapeHtml(l.name)} chromatogram">
+        <form class="rt-max" data-role="rt-max">
+          <label>Retention time limit
+            <input type="number" class="mono" min="0.1" step="0.1" value="${l.rt_max}"
+              data-role="rt-max-input"> min</label>
+          <button type="submit" class="ghost small">Apply</button>
+          ${l.rt_max_custom ? `<button type="button" class="ghost small" data-role="rt-max-reset">
+            Back to ${l.rt_max_default}</button>` : `<span class="note">run default</span>`}
+          <span class="note" data-role="rt-max-status"></span>
+          <button type="button" class="ghost small edit-peaks" data-role="edit-peaks">Edit peaks</button>
+        </form>
+        ${warn}
+      </div>
+      <div class="ladder-indexes">
+        <h4>Indexes to fit with</h4>
+        <p class="note">${usable ? "Greyed-out indexes are not usable in the standard." : ""}</p>
+        <div class="index-list" data-role="list"></div>
+        <div class="index-actions">
+          <button type="button" class="ghost small" data-role="all">All</button>
+          <button type="button" class="ghost small" data-role="none">None</button>
+        </div>
+      </div>
+    </div>`;
+
+  const present = Object.keys(l.peaks).map(Number).sort((a, b) => a - b);
+  const list = card.querySelector("[data-role=list]");
+  const exact = new Set((l.exact || []).map(Number));
+  const count = () => {
+    card.querySelector("[data-role=count]").textContent =
+      `${state.selected.length} of ${present.length} indexes ticked`;
+    fitStale();
+  };
+  const paint = () => {
+    const chosen = new Set(state.selected);
+    for (const row of list.children) {
+      const i = Number(row.dataset.i);
+      row.querySelector("input").checked = chosen.has(i);
+      row.classList.toggle("off", !chosen.has(i));
+    }
+    count();
+  };
+  for (const i of present) {
+    const row = document.createElement("label");
+    row.dataset.i = i;
+    const blocked = usable && !usable.has(i);
+    const mark = l.manual && l.manual[i] !== undefined
+      ? `<span class="by-hand" title="${exact.has(i) ? "placed exactly by hand" : "placed by hand"}">${exact.has(i) ? "◇" : "◆"}</span>` : "";
+    row.innerHTML = `<input type="checkbox" ${blocked ? "disabled" : ""}>
+      <span class="idx">${i}</span><span class="rt">${l.peaks[i].toFixed(2)}</span>${mark}`;
+    if (blocked) row.title = "Not usable in the standard ladder";
+    row.querySelector("input").onchange = (ev) => {
+      const set = new Set(state.selected);
+      ev.target.checked ? set.add(i) : set.delete(i);
+      state.selected = [...set].sort((a, b) => a - b);
+      paint();
+    };
+    list.appendChild(row);
+  }
+  const allowed = present.filter(i => !usable || usable.has(i));
+  card.querySelector("[data-role=all]").onclick = () => { state.selected = [...allowed]; paint(); };
+  card.querySelector("[data-role=none]").onclick = () => { state.selected = []; paint(); };
+  paint();
+
+  card.querySelector("[data-role=rt-max]").onsubmit = (ev) => {
+    ev.preventDefault();
+    applyLadderRtMax(card, card.querySelector("[data-role=rt-max-input]").value);
+  };
+  const reset = card.querySelector("[data-role=rt-max-reset]");
+  if (reset) reset.onclick = () => applyLadderRtMax(card, null);
+  card.querySelector("[data-role=edit-peaks]").onclick = () => openPeakEditor(card, l, {
+    traces: () => fetch(api("/ladder/traces")).then(r => r.json()),
+    save: (picks) => postJson("/ladder/peaks", { picks }),
+    rebuild: (entry) => mainLadderCard(entry),
+    onSaved: (_card, d2) => showLadderPage(d2, "Peaks saved; fit again"),
+    alert: showAlert,
+  });
+  return card;
+}
+
+function applyLadderRtMax(card, value) {
+  const status = card.querySelector("[data-role=rt-max-status]");
+  card.querySelectorAll("[data-role=rt-max] button, [data-role=rt-max] input")
+    .forEach(el => { el.disabled = true; });
+  status.textContent = "Re-picking peaks…";
+  postJson("/ladder/rt_max", { rt_max: value }).then(d => {
+    if (d.error) throw new Error(d.error);
+    showLadderPage(d, `${d.ladder.n_peaks} peaks; ticks reset, fit again`);
+  }).catch(e => {
+    card.querySelectorAll("[data-role=rt-max] button, [data-role=rt-max] input")
+      .forEach(el => { el.disabled = false; });
+    status.textContent = "";
+    showAlert("Could not apply the limit", [e.message]);
+  });
+}
+
+const sameSet = (a, b) => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/* A fit is only good for the ticks and model it was made with. */
+function fitStale() {
+  const d = state.ladderPage;
+  if (!d) return;
+  const go = $("to-compounds");
+  if (!d.standard) { go.disabled = false; return; }
+  const fit = d.fit;
+  const current = fit && sameSet(fit.transform.indexes.map(Number),
+    state.selected.filter(i => d.standard.usable_indexes.includes(i)))
+    && fit.model === $("fit-model").value;
+  go.disabled = !current;
+  $("fit-status").textContent = fit && !current
+    ? "Ticks or model changed since this fit — fit again to continue." : "";
+}
+$("fit-model").onchange = fitStale;
+
+function renderFit(d) {
+  const box = $("fit-result");
+  if (!d.standard) {
+    $("fit-line").textContent = (d.standard_error || "No standard ladder saved.") +
+      " Compound times will be the instrument's own.";
+    $("fit-controls").classList.add("hidden");
+    box.innerHTML = "";
+    fitStale();
+    return;
+  }
+  $("fit-controls").classList.remove("hidden");
+  $("fit-line").innerHTML = `x = this run's ladder retention time, y = the same index on
+    <b>${escapeHtml(d.standard.name)}</b>. Only ticked indexes that are usable in the standard
+    take part.`;
+  const f = d.fit;
+  if (!f) {
+    box.innerHTML = `<p class="note">Not fitted yet.</p>`;
+    fitStale();
+    return;
+  }
+  const rows = f.models.map(m => `
+    <tr class="${m.key === f.model ? "chosen" : ""}">
+      <td>${({ linear: "Linear", quadratic: "Quadratic", cubic: "Cubic" })[m.key] || escapeHtml(m.key)}${m.key === f.suggested ? ' <span class="tag">suggested</span>' : ""}</td>
+      <td class="mono">${escapeHtml(m.equation)}</td>
+      <td class="mono">${m.rmse.toFixed(4)}</td>
+      <td class="mono">${m.std_error === null ? "—" : m.std_error.toFixed(4)}</td>
+      <td class="mono">${m.max_abs_residual.toFixed(4)}</td>
+      <td class="mono">${m.r2.toFixed(6)}</td>
+    </tr>`).join("");
+  const notes = [];
+  if (f.monotonic && !f.monotonic.monotonic) {
+    notes.push(`The ${f.model} curve turns over at ${f.monotonic.turns_at} min, so later
+      times would be mapped out of order. Try a simpler model or other indexes.`);
+  }
+  if (f.excluded_by_standard.length) {
+    notes.push(`Index ${f.excluded_by_standard.join(", ")} ticked here but not usable in the standard, so left out.`);
+  }
+  box.innerHTML = `
+    <figure class="plate fit-plate"><img src="${api("/figure/" + encodeURIComponent(f.figure))}?t=${Date.now()}"
+      alt="Ladder fit"><figcaption><b>${escapeHtml(f.transform.model)} fit over
+      ${f.transform.n_indexes} indexes</b><span>${f.transform.indexes.join(", ")}</span></figcaption></figure>
+    ${notes.length ? `<ul class="card-warnings fit-notes">${notes.map(n => `<li>${n}</li>`).join("")}</ul>` : ""}
+    <div class="table-wrap"><table class="fit-table">
+      <caption>Every model on the same indexes; the highlighted one is used</caption>
+      <thead><tr><th>Model</th><th>Equation</th><th>RMSE (min)</th><th>Std. error</th>
+      <th>Largest residual</th><th>R²</th></tr></thead><tbody>${rows}</tbody></table></div>
+    ${f.uncalibrated ? `<p class="note">Before any fit, RMSE ${f.uncalibrated.rmse.toFixed(4)} min.
+      "Suggested" is the simplest model that nothing beats by more than 5% on standard error.</p>` : ""}`;
+  box.querySelector("img").onclick = () => {
+    $("lightbox-img").src = box.querySelector("img").src;
+    $("lightbox").classList.remove("hidden");
+  };
+  fitStale();
+}
+
+$("run-fit").onclick = () => {
+  const button = $("run-fit");
+  button.disabled = true;
+  $("fit-status").textContent = "Fitting…";
+  postJson("/fit", { model: $("fit-model").value, indexes: state.selected }).then(d => {
+    button.disabled = false;
+    if (d.error) throw new Error(d.error);
+    showLadderPage(d);
+    $("fit-card").scrollIntoView({ behavior: "smooth", block: "start" });
+  }).catch(e => {
+    button.disabled = false;
+    $("fit-status").textContent = "";
+    showAlert("Could not fit", [e.message]);
+  });
+};
+
+$("back-to-input").onclick = () => goStep(1);
+$("to-compounds").onclick = () => {
+  if (peakEditorOpen()) return showAlert("Finish the peak edit first", ["Save or cancel the open peak editor."]);
+  showWorking("Reading the compounds",
+    "Each compound is put on the standard's time axis through the fit you approved.");
+  postJson("/compounds").then(d => {
+    if (d.error) throw new Error(d.error);
+    return pollJob(d.job);
+  }).then(loadChromatograms).catch(e => failed(e, 2));
+};
+
+/* ============================================== step 3: chromatograms */
 function loadChromatograms() {
   return fetch(`/api/session/${state.session}/chromatograms`).then(r => r.json()).then(d => {
     state.summary = d.summary;
@@ -249,28 +546,14 @@ function loadChromatograms() {
       plate(box, fig, sub);
     }
 
-    const sel = $("ladder-limit");
-    sel.innerHTML = "";
-    const all = document.createElement("option");
-    all.value = "all";
-    all.textContent = `All ${lad.n_points} indexes`;
-    sel.appendChild(all);
-    for (let i = lad.n_points; i >= 2; i--) {
-      const o = document.createElement("option");
-      o.value = i;
-      o.textContent = `1 to ${i}`;
-      sel.appendChild(o);
-    }
-    sel.value = lad.limit >= lad.n_points ? "all" : String(lad.limit);
-
     buildTables(d.summary);
     showAlert("Check these before you continue", d.summary.warnings);
     // the scans behind the spectra just changed, so anything downstream is stale
     state.spectraFresh = false;
     state.exportFresh = false;
-    state.reached = 2;
-    reach(2);
-    goStep(2);
+    state.reached = 3;
+    reach(3);
+    goStep(3);
   });
 }
 
@@ -279,7 +562,7 @@ function renderAxisBanner(summary) {
   if (!el) {
     el = document.createElement("div");
     el.id = "axis-banner";
-    $("step-2").querySelector(".panel-head").after(el);
+    $("step-3").querySelector(".panel-head").after(el);
   }
   if (summary.standard) {
     const t = summary.standard.transform;
@@ -372,21 +655,6 @@ function buildTables(summary) {
   $("index-table").innerHTML = html;
 }
 
-$("apply-limit").onclick = () => {
-  const params = {};
-  for (const el of document.querySelectorAll(".settings input")) params[el.name] = el.value;
-  showWorking("Replotting", "The scans are already read, so this only takes a moment.");
-  fetch(`/api/session/${state.session}/reanalyse`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      params,
-      transform_model: $("transform-model").value,
-      ladder_limit: $("ladder-limit").value,
-      ladder_masses: document.querySelector('input[name=ladder_masses]').value
-    })
-  }).then(r => r.json()).then(d => pollJob(d.job)).then(loadChromatograms).catch(e => failed(e, 2));
-};
-
 $("say-no").onclick = () => {
   showAlert("What to check", [
     "Confirm the ladder file is the ladder run and its masses match the list.",
@@ -399,8 +667,8 @@ $("say-no").onclick = () => {
   goStep(1);
 };
 
-/* ================================================ step 3: mass spectra */
-$("say-yes").onclick = () => enterStep(3);
+/* ================================================ step 4: mass spectra */
+$("say-yes").onclick = () => enterStep(4);
 
 function buildSpectra() {
   showWorking("Building mass spectra",
@@ -410,7 +678,7 @@ function buildSpectra() {
     body: JSON.stringify({ correct: true })
   }).then(r => r.json()).then(d => pollJob(d.job))
     .then(() => fetch(`/api/session/${state.session}/spectra`).then(r => r.json()))
-    .then(showSpectra).catch(e => failed(e, 2));
+    .then(showSpectra).catch(e => failed(e, 3));
 }
 
 function showSpectra(d) {
@@ -432,12 +700,12 @@ function showSpectra(d) {
     for (const f of figs) plate(box, f, `${f.subtitle} · ${f.n_scans} scans`);
   }
   state.spectraFresh = true;
-  reach(3);
-  goStep(3);
+  reach(4);
+  goStep(4);
 }
 
-$("back-to-chrom").onclick = () => enterStep(2);
-$("to-download").onclick = () => enterStep(4);
+$("back-to-chrom").onclick = () => enterStep(3);
+$("to-download").onclick = () => enterStep(5);
 
 function fillManifest() {
   const counts = {};
@@ -445,7 +713,8 @@ function fillManifest() {
   const n = state.summary.compounds.length;
   const levels = Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ");
   $("manifest").innerHTML = `
-    <li>Chromatogram figures<span>${n + 1} figures, PNG and PDF</span></li>
+    <li>Chromatogram figures<span>the ladder${state.ladderPage && state.ladderPage.fit ? ", its fit" : ""}
+      and ${n} compound${n === 1 ? "" : "s"}, PNG and PDF</span></li>
     <li>Mass spectrum figures<span>${state.spectra.length} figures (${levels}), PNG and PDF</span></li>
     <li>Chromatogram traces<span>every retention time and intensity, ladder and compounds</span></li>
     <li>Peak tables<span>index, height, area, and peak 1 vs peak 2 ratios</span></li>
@@ -456,11 +725,11 @@ function fillManifest() {
     $("build-export").classList.remove("hidden");
     $("build-export").disabled = false;
   }
-  reach(4);
+  reach(5);
 }
 
-/* ==================================================== step 4: download */
-$("back-to-spectra").onclick = () => enterStep(3);
+/* ==================================================== step 5: download */
+$("back-to-spectra").onclick = () => enterStep(4);
 $("build-export").onclick = () => {
   $("build-export").disabled = true;
   showWorking("Creating the results file", "Figures are re-rendered at print resolution.");
@@ -470,10 +739,10 @@ $("build-export").onclick = () => {
       return pollJob(d.job);
     }).then(() => {
       state.exportFresh = true;
-      goStep(4);
+      goStep(5);
       $("build-export").classList.add("hidden");
       const a = $("download");
       a.href = `/api/session/${state.session}/download`;
       a.classList.remove("hidden");
-    }).catch(e => { $("build-export").disabled = false; failed(e, 4); });
+    }).catch(e => { $("build-export").disabled = false; failed(e, 5); });
 };

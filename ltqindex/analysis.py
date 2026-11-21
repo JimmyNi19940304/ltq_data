@@ -223,6 +223,12 @@ class Ladder:
         self.rt_points = np.asarray(rts, float)[order]
         self.index_points = np.asarray(indices, float)[order]
         self.limit = self.set_limit(limit)
+        # indexes the operator unticked: drawn, but kept out of the calibration
+        self.excluded = set()
+
+    def uses(self, index):
+        """Does this index take part in the calibration?"""
+        return int(index) <= self.limit and int(index) not in self.excluded
 
     @property
     def max_index(self):
@@ -246,7 +252,8 @@ class Ladder:
     @property
     def calibration(self):
         """The (retention times, indices) actually used for interpolation."""
-        keep = self.index_points <= self.limit
+        keep = (self.index_points <= self.limit) & ~np.isin(
+            self.index_points, sorted(self.excluded))
         return self.rt_points[keep], self.index_points[keep]
 
     @property
@@ -327,7 +334,7 @@ class Ladder:
                         "area": pk.area,
                         "rt_start": round(pk.rt_start, 4),
                         "rt_end": round(pk.rt_end, 4),
-                        "calibrating": int(pk.index) <= self.limit,
+                        "calibrating": self.uses(pk.index),
                         "manual": pk.manual,
                     }
                 )

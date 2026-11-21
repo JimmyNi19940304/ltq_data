@@ -14,10 +14,13 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from werkzeug.utils import secure_filename
 
-from ltqindex.analysis import DEFAULT_LADDER_MASSES, Params
+from ltqindex.analysis import DEFAULT_LADDER_MASSES, Params, analyse_ladder
 from ltqindex.calibration import MODELS, ConfigError, load_config
 from ltqindex.standards import StandardError_, folders, load_standard
+from ltqindex.ladderedit import traces_payload
+from ltqindex.msdata import load_run
 from ltqindex.pipeline import Job, Session, safe_name
+from ltqindex.plotting import plot_ladder
 from ltqindex.rawconv import parser_status
 
 ROOT = Path(__file__).resolve().parent
@@ -55,10 +58,64 @@ def standard_status():
         "name": record["name"],
         "saved_at": record.get("saved_at"),
         "n_peaks": len(record["peaks"]),
+        "peaks": {int(k): v for k, v in record["peaks"].items()},
         "usable_indexes": record["usable_indexes"],
+        "manual_indexes": record.get("manual_indexes", []),
+        "absent_indexes": record.get("absent_indexes", []),
+        "ladder_masses": record.get("ladder_masses"),
+        "source_file": record.get("source_file"),
+        "standard_file": str(paths["standard_file"]),
         "standard_dir": str(paths["standard_dir"]),
         "compound_dir": str(paths["compound_dir"]),
     }
+
+
+STANDARD_FIGURES = WORK_ROOT / "standard-figure"
+
+
+def standard_figure_path():
+    """Draw the saved standard ladder from its own .raw file, peaks as saved.
+
+    The peaks are put back exactly where the calibration app saved them, so the
+    picture shows the standard the compounds are placed on, not a fresh guess.
+    Drawn once per saved standard and then reused. Raises LookupError with a
+    message when it cannot be drawn.
+    """
+    ladder_dir = ladder_dir_from_config()
+    if ladder_dir is None:
+        raise LookupError("No config.json, so there is no standard ladder folder to read.")
+    try:
+        record = load_standard(ladder_dir)
+    except StandardError_ as exc:
+        raise LookupError(str(exc)) from None
+    if record is None:
+        raise LookupError("No standard ladder saved yet.")
+    source = Path(str(record.get("source_file") or ""))
+    if not source.is_file():
+        raise LookupError(f"The standard's .raw file is not at {source}, so it cannot be "
+                          "drawn. Its index table is still used.")
+
+    stem = STANDARD_FIGURES / safe_name(f"{record['name']}_{record.get('saved_at', '')}")
+    png = stem.parent / (stem.name + ".png")
+    if png.is_file():
+        return png
+    run = load_run(source, WORK_ROOT / "scan-cache")
+    params = Params.from_dict(record.get("params") or {})
+    masses = record.get("ladder_masses") or DEFAULT_LADDER_MASSES
+    peaks = {int(k): float(v) for k, v in record["peaks"].items()}
+    manual = {i: None for i in range(1, 2 * len(masses) + 1)}
+    manual.update({i: {"rt": rt, "exact": True} for i, rt in peaks.items()})
+    ladder = analyse_ladder(run, masses, params, manual=manual, fixed_slots=True)
+    by_hand = {int(i) for i in record.get("manual_indexes", [])}
+    for tr in ladder.traces:
+        for pk in tr["peaks"]:
+            pk.manual = int(pk.index) in by_hand
+            pk.exact = False
+    ladder.excluded = set(peaks) - {int(i) for i in record.get("usable_indexes", peaks)}
+    for old in STANDARD_FIGURES.glob("*.png"):
+        old.unlink()
+    plot_ladder(ladder, f"{record['name']} (standard)", stem, formats=("png",))
+    return png
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024 * 1024   # raw files run to hundreds of MB
@@ -98,6 +155,15 @@ def index():
     return send_from_directory(app.template_folder or "templates", "index.html")
 
 
+@app.get("/api/standard/figure")
+def standard_figure():
+    try:
+        png = standard_figure_path()
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    return send_file(png, mimetype="image/png", max_age=0)
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"parser": parser_status(), "default_masses": DEFAULT_LADDER_MASSES,
@@ -112,15 +178,20 @@ def create_session():
     """Accepts multipart form data: the ladder file plus 1-5 compound files.
 
     Each file may be uploaded, or given as a path already on this machine
-    (field `ladder_path` / `compound_path_N`) which avoids a large upload.
+    (field `ladder_path` / `compound_path_N`) which avoids a large upload. Only
+    the ladder is read now; the compounds wait until its fit is approved.
     """
-    session = Session(WORK_ROOT)
+    session = Session(WORK_ROOT, overrides_folder=CONFIG_PATH.parent)
 
     ladder_src = _stash(session, request.files.get("ladder_file"),
                         request.form.get("ladder_path", "").strip(), "ladder")
     if ladder_src is None:
         return jsonify({"error": "Choose a ladder .raw file."}), 400
     session.ladder_path = ladder_src
+    # the ladder's own name keys its hand edits, shared with the calibration app
+    upload = request.files.get("ladder_file")
+    session.ladder_file = (upload.filename if upload is not None and upload.filename
+                           else Path(request.form.get("ladder_path", "").strip()).name)
 
     masses = _parse_masses(request.form.get("ladder_masses", ""))
     if len(masses) < 2:
@@ -152,13 +223,9 @@ def create_session():
 
     session.params = Params.from_dict(request.form.to_dict())
     session.ladder_dir = ladder_dir_from_config()
-    model = (request.form.get("transform_model") or "quadratic").strip()
-    if model not in {k for k, _, _ in MODELS}:
-        return jsonify({"error": f"Unknown transform model '{model}'."}), 400
-    session.transform_model = model
     SESSIONS[session.id] = session
 
-    job = start_job(session.run_chromatograms)
+    job = start_job(session.run_ladder)
     return jsonify({"session": session.id, "job": job.id})
 
 
@@ -179,16 +246,6 @@ def _stash(session: Session, upload, server_path: str, tag: str):
             shutil.copy2(src, dest)
         return dest
     return None
-
-
-def _parse_limit(value):
-    """'all', '' or None mean calibrate with every ladder index."""
-    if value in (None, "", "all"):
-        return None
-    try:
-        return max(2, int(value))
-    except (TypeError, ValueError):
-        return None
 
 
 def _parse_masses(text):
@@ -219,21 +276,74 @@ def chromatograms(sid):
     })
 
 
-@app.post("/api/session/<sid>/reanalyse")
-def reanalyse(sid):
-    """Re-run chromatograms with edited settings. Converted scans stay cached."""
+# ------------------------------------------------------- step 2: the ladder
+def _ladder_ready(session):
+    if session.ladder is None:
+        abort(400, description="The ladder has not been read yet.")
+
+
+@app.get("/api/session/<sid>/ladder")
+def ladder_page(sid):
+    """The ladder, the standard it is fitted onto, and the fit if one was made."""
     session = get_session(sid)
+    _ladder_ready(session)
+    return jsonify(session.ladder_page())
+
+
+@app.get("/api/session/<sid>/ladder/traces")
+def ladder_traces(sid):
+    session = get_session(sid)
+    _ladder_ready(session)
+    return jsonify(traces_payload(session.ladder, session.ladder_name))
+
+
+@app.post("/api/session/<sid>/ladder/rt_max")
+def ladder_rt_max(sid):
+    """Re-pick the ladder with its own retention-time limit; null = the default."""
+    session = get_session(sid)
+    _ladder_ready(session)
+    try:
+        session.set_ladder_rt_max((request.get_json(silent=True) or {}).get("rt_max"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(session.ladder_page())
+
+
+@app.post("/api/session/<sid>/ladder/peaks")
+def ladder_peaks(sid):
+    """Place ladder peaks by hand: {"picks": {index: time, {"rt", "exact"}, or null}}."""
+    session = get_session(sid)
+    _ladder_ready(session)
+    try:
+        session.set_ladder_picks((request.get_json(silent=True) or {}).get("picks"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(session.ladder_page())
+
+
+@app.post("/api/session/<sid>/fit")
+def fit(sid):
+    """Fit the ladder onto the standard: {"model": "cubic", "indexes": [1, 2, ...]}."""
+    session = get_session(sid)
+    _ladder_ready(session)
     payload = request.get_json(silent=True) or {}
-    session.params = Params.from_dict(payload.get("params"))
-    model = payload.get("transform_model")
-    if model:
-        if model not in {k for k, _, _ in MODELS}:
-            return jsonify({"error": f"Unknown transform model '{model}'."}), 400
-        session.transform_model = model
-    if payload.get("ladder_masses"):
-        session.ladder_masses = _parse_masses(str(payload["ladder_masses"]))
-    if "ladder_limit" in payload:
-        session.ladder_limit = _parse_limit(payload["ladder_limit"])
+    model = payload.get("model") or session.transform_model
+    if model not in {k for k, _, _ in MODELS}:
+        return jsonify({"error": f"Unknown model '{model}'."}), 400
+    try:
+        session.fit_ladder(model, payload.get("indexes") or [])
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(session.ladder_page())
+
+
+@app.post("/api/session/<sid>/compounds")
+def compounds(sid):
+    """Read the compounds and put them through the approved fit."""
+    session = get_session(sid)
+    _ladder_ready(session)
+    if session.standard is not None and session.transform is None:
+        return jsonify({"error": "Fit the ladder onto the standard first."}), 400
     job = start_job(session.run_chromatograms)
     return jsonify({"job": job.id})
 

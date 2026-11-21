@@ -10,18 +10,19 @@ state rather than per-session.
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import json
 import threading
 import traceback
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 
-from ltqindex.analysis import analyse_ladder, candidate_peaks
+from ltqindex.analysis import analyse_ladder
 from ltqindex.calibration import ConfigError, calibrate, find_ladders, load_config, summarise
 from ltqindex.standards import (StandardError_, folders, list_archive, load_standard,
                                 save_standard)
+from ltqindex.ladderedit import (ladder_entry, load_overrides, overrides_path,
+                                 parse_picks, parse_rt_max, saved_picks, store_override,
+                                 traces_payload, with_rt_max)
 from ltqindex.msdata import load_run
 from ltqindex.pipeline import Job, safe_name
 from ltqindex.plotting import plot_ladder
@@ -32,10 +33,6 @@ WORK = ROOT / "workspace"
 FIGURES = WORK / "calibrate-figures"
 SCAN_CACHE = WORK / "scan-cache"        # shared with the main app
 CONFIG_PATH = ROOT / "config.json"
-# per-ladder rt_max and hand-placed peaks chosen on page 1, kept apart from
-# config.json; lives beside it
-OVERRIDES_FILENAME = "ladder_overrides.json"
-LEGACY_RT_MAX_FILENAME = "ladder_rt_max.json"   # the earlier rt_max-only file
 
 app = Flask(__name__)
 STATE = {"ladders": [], "config": None, "config_error": None, "standard_error": None}
@@ -103,114 +100,16 @@ def config():
         "files": [f.name for f in files],
         "masses": cfg["ladder_masses"],
         "params": cfg["params"].to_dict(),
-        "overrides_file": str(overrides_path()),
+        "overrides_file": str(overrides_path(overrides_folder())),
         "parser": parser_status(),
         "loaded": [l["name"] for l in STATE["ladders"]],
     })
 
 
 # ----------------------------------------------------------------- page 1
-def parse_pick(value):
-    """A hand-made choice for one index, from JSON.
-
-    None means the index has no peak; a number is a time to snap to the top of
-    the peak it lies on; {"rt": minutes, "exact": true} is a peak put on that
-    scan without snapping. Raises ValueError for anything else.
-    """
-    if value is None:
-        return None
-    if isinstance(value, dict):
-        rt = float(value.get("rt"))
-        return {"rt": rt, "exact": True} if value.get("exact") else rt
-    if isinstance(value, bool):
-        raise ValueError(value)
-    return float(value)
-
-
-def overrides_path() -> Path:
-    return CONFIG_PATH.parent / OVERRIDES_FILENAME
-
-
-def load_overrides() -> dict:
-    """{ladder file name: {"rt_max": minutes, "peaks": {index: rt or None}}}.
-
-    Both keys are optional. The older ladder_rt_max.json, which held only rt_max,
-    is read too so nothing set before the peak editor existed is lost; the newer
-    file wins where both name a ladder. A broken file is ignored.
-    """
-    out: dict[str, dict] = {}
-    for path in (CONFIG_PATH.parent / LEGACY_RT_MAX_FILENAME, overrides_path()):
-        if not path.is_file():
-            continue
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        ladders = raw.get("ladders", raw) if isinstance(raw, dict) else {}
-        for name, value in ladders.items():
-            if str(name).startswith("_"):
-                continue
-            entry = out.setdefault(str(name), {})
-            if not isinstance(value, dict):        # legacy: {"file.raw": 55}
-                value = {"rt_max": value}
-            if "rt_max" in value:
-                try:
-                    entry["rt_max"] = float(value["rt_max"])
-                except (TypeError, ValueError):
-                    pass
-            if isinstance(value.get("peaks"), dict):
-                peaks = {}
-                for k, v in value["peaks"].items():
-                    try:
-                        peaks[int(k)] = parse_pick(v)
-                    except (TypeError, ValueError):
-                        continue
-                entry["peaks"] = peaks
-    return {k: v for k, v in out.items() if v}
-
-
-def save_overrides(overrides: dict):
-    body = {
-        "_note": "Per-ladder settings made on page 1 of the calibration app. rt_max is "
-                 "in minutes; ladders without one use params.rt_max from config.json. "
-                 "peaks maps a ladder index to the retention time of the peak placed "
-                 "there by hand, or null when that index has no peak.",
-        "ladders": {},
-    }
-    for name in sorted(overrides, key=str.lower):
-        entry = overrides[name]
-        clean = {}
-        if entry.get("rt_max") is not None:
-            clean["rt_max"] = entry["rt_max"]
-        if entry.get("peaks"):
-            clean["peaks"] = {str(k): v for k, v in sorted(entry["peaks"].items())}
-        if clean:
-            body["ladders"][name] = clean
-    path = overrides_path()
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    legacy = CONFIG_PATH.parent / LEGACY_RT_MAX_FILENAME
-    if legacy.is_file():
-        legacy.unlink()      # its values now live in the new file
-
-
-def store_override(file_name, *, rt_max, default_rt_max, peaks):
-    overrides = load_overrides()
-    entry = {}
-    if rt_max is not None and float(rt_max) != float(default_rt_max):
-        entry["rt_max"] = float(rt_max)
-    if peaks:
-        entry["peaks"] = dict(peaks)
-    if entry:
-        overrides[file_name] = entry
-    else:
-        overrides.pop(file_name, None)
-    save_overrides(overrides)
-
-
-def ladder_params(cfg, rt_max):
-    return dataclasses.replace(cfg["params"], rt_max=float(rt_max))
+def overrides_folder() -> Path:
+    """ladder_overrides.json lives beside config.json, shared with the main app."""
+    return CONFIG_PATH.parent
 
 
 def analyse_one(path: Path, position: int, cfg, rt_max, manual=None, progress=None) -> dict:
@@ -220,53 +119,19 @@ def analyse_one(path: Path, position: int, cfg, rt_max, manual=None, progress=No
     peak marked as missing leaves a gap rather than renumbering the rest.
     """
     run = load_run(path, SCAN_CACHE, progress=progress)
-    params = ladder_params(cfg, rt_max)
+    params = with_rt_max(cfg["params"], rt_max)
     ladder = analyse_ladder(run, cfg["ladder_masses"], params, manual=manual,
                             fixed_slots=True)
     LADDER_OBJECTS[path.stem] = ladder
 
     stem = FIGURES / f"ladder_{position:02d}_{safe_name(path.stem)}"
     plot_ladder(ladder, path.stem, stem, formats=("png",))
-    default = float(cfg["params"].rt_max)
-    warnings = ladder.warnings()
-    if ladder.dropped:
-        warnings.insert(0, "Hand-placed peak for index "
-                        + ", ".join(str(i) for i in ladder.dropped)
-                        + " is past the retention time limit, so the automatic pick is used.")
-    return {
-        "name": path.stem,
-        "file": path.name,
-        "path": str(path),
-        "position": position,
-        "figure": stem.name + ".png",
-        "peaks": {int(pk.index): round(float(pk.rt), 5)
-                  for tr in ladder.traces for pk in tr["peaks"]},
-        "manual": {int(pk.index): round(float(pk.rt), 5)
-                   for tr in ladder.traces for pk in tr["peaks"] if pk.manual},
-        # hand-placed on the clicked scan, without snapping to a peak top
-        "exact": sorted(int(pk.index) for tr in ladder.traces for pk in tr["peaks"]
-                        if pk.exact),
-        "auto_peaks": {int(k): round(float(v), 5) for k, v in ladder.auto_rt.items()},
-        "absent": ladder.absent,
-        "dropped": ladder.dropped,
-        "expected": 2 * len(cfg["ladder_masses"]),
-        "masses": [float(m) for m in cfg["ladder_masses"]],
-        "n_peaks": ladder.n_points,
-        "monotonic": ladder.is_monotonic,
-        "warnings": warnings,
-        "rt_max": float(rt_max),
-        "rt_max_default": default,
-        "rt_max_custom": float(rt_max) != default,
-    }
-
-
-def _saved_picks(entry):
-    """The hand-made choices worth keeping: placed peaks and missing marks."""
-    exact = {int(i) for i in entry.get("exact", [])}
-    picks = {int(k): ({"rt": v, "exact": True} if int(k) in exact else v)
-             for k, v in entry["manual"].items()}
-    picks.update({int(i): None for i in entry["absent"]})
-    return picks
+    entry = ladder_entry(ladder, name=path.stem, file=path.name, figure=stem.name + ".png",
+                         rt_max=rt_max, default_rt_max=cfg["params"].rt_max,
+                         masses=cfg["ladder_masses"])
+    entry["path"] = str(path)
+    entry["position"] = position
+    return entry
 
 
 def scan_ladders(job: Job):
@@ -282,7 +147,7 @@ def scan_ladders(job: Job):
         old.unlink()
     LADDER_OBJECTS.clear()
 
-    overrides = load_overrides()
+    overrides = load_overrides(overrides_folder())
     default = cfg["params"].rt_max
     ladders = []
     for i, path in enumerate(files):
@@ -347,7 +212,7 @@ def _replace_entry(index, entry):
     STATE["ladders"][index] = entry
     counts = sorted({l["n_peaks"] for l in STATE["ladders"]})
     return jsonify({"ladder": entry, "mixed_peak_counts": len(counts) > 1,
-                    "saved_to": str(overrides_path())})
+                    "saved_to": str(overrides_path(overrides_folder()))})
 
 
 @app.post("/api/ladder/rt_max")
@@ -362,28 +227,17 @@ def set_ladder_rt_max():
     index, cfg, error = _find_loaded(payload.get("name"))
     if error:
         return error
-
     current = STATE["ladders"][index]
-    value = payload.get("rt_max")
-    if value in (None, ""):
-        rt_max = float(cfg["params"].rt_max)
-    else:
-        try:
-            rt_max = float(value)
-        except (TypeError, ValueError):
-            return jsonify({"error": f"'{value}' is not a number of minutes."}), 400
-        if not rt_max > 0:
-            return jsonify({"error": "The retention time limit must be above 0 min."}), 400
-
     try:
+        rt_max = parse_rt_max(payload.get("rt_max"), cfg["params"].rt_max)
         entry = analyse_one(Path(current["path"]), current.get("position", index), cfg,
-                            rt_max, manual=_saved_picks(current))
+                            rt_max, manual=saved_picks(current))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
     # a hand-placed peak now past the limit is let go rather than kept in reserve
-    store_override(entry["file"], rt_max=rt_max, default_rt_max=cfg["params"].rt_max,
-                   peaks=_saved_picks(entry))
+    store_override(overrides_folder(), entry["file"], rt_max=rt_max,
+                   default_rt_max=cfg["params"].rt_max, peaks=saved_picks(entry))
     return _replace_entry(index, entry)
 
 
@@ -391,35 +245,18 @@ def set_ladder_rt_max():
 def set_ladder_peaks():
     """Place peaks by hand on one ladder.
 
-    Body: {"name": ladder name, "picks": {index: retention time, or null for "this
-    index has no peak"}}. The picks replace every earlier hand-made choice for
-    that ladder, so {} goes back to automatic picking. Each time is moved to the
-    top of the peak it lies on, on that index's own mass trace.
+    Body: {"name": ladder name, "picks": {index: pick}}, a pick being a time to
+    snap to the peak top, {"rt": t, "exact": true}, or null for "this index has no
+    peak". The picks replace every earlier hand-made choice for that ladder, so
+    {} goes back to automatic picking.
     """
     payload = request.get_json(silent=True) or {}
     index, cfg, error = _find_loaded(payload.get("name"))
     if error:
         return error
     current = STATE["ladders"][index]
-    expected = 2 * len(cfg["ladder_masses"])
-
-    picks = {}
-    for key, value in (payload.get("picks") or {}).items():
-        try:
-            i = int(key)
-        except (TypeError, ValueError):
-            return jsonify({"error": f"'{key}' is not a ladder index."}), 400
-        if not 1 <= i <= expected:
-            return jsonify({"error": f"Index {i} is outside 1-{expected}."}), 400
-        if value is None:
-            picks[i] = None
-            continue
-        try:
-            picks[i] = parse_pick(value)
-        except (TypeError, ValueError):
-            return jsonify({"error": f"'{value}' is not a retention time."}), 400
-
     try:
+        picks = parse_picks(payload.get("picks"), 2 * len(cfg["ladder_masses"]))
         entry = analyse_one(Path(current["path"]), current.get("position", index), cfg,
                             current["rt_max"], manual=picks)
     except ValueError as exc:
@@ -428,8 +265,8 @@ def set_ladder_peaks():
         return jsonify({"error": "Index " + ", ".join(map(str, entry["dropped"]))
                         + " was placed past the retention time limit."}), 400
 
-    store_override(entry["file"], rt_max=current["rt_max"],
-                   default_rt_max=cfg["params"].rt_max, peaks=_saved_picks(entry))
+    store_override(overrides_folder(), entry["file"], rt_max=current["rt_max"],
+                   default_rt_max=cfg["params"].rt_max, peaks=saved_picks(entry))
     return _replace_entry(index, entry)
 
 
@@ -440,20 +277,7 @@ def ladder_traces():
     ladder = LADDER_OBJECTS.get(name)
     if ladder is None:
         return jsonify({"error": "That ladder is not loaded. Reload from ladder_dir."}), 400
-    rt = ladder.traces[0]["rt"] if ladder.traces else []
-    return jsonify({
-        "name": name,
-        "rt": [round(float(v), 4) for v in rt],
-        "smooth_window": int(ladder.params.smooth_window),
-        "traces": [
-            {
-                "mass": tr["mass"],
-                "intensity": [float(f"{v:.5g}") for v in tr["intensity"]],
-                "candidates": candidate_peaks(tr["rt"], tr["intensity"], ladder.params),
-            }
-            for tr in ladder.traces
-        ],
-    })
+    return jsonify(traces_payload(ladder, name))
 
 
 @app.get("/api/figure/<path:name>")
@@ -555,7 +379,7 @@ def save_active_standard():
         info = save_standard(
             cfg["ladder_dir"], name=name, peaks=peaks,
             masses=cfg["ladder_masses"],
-            params=ladder_params(cfg, ladder.get("rt_max", cfg["params"].rt_max)),
+            params=with_rt_max(cfg["params"], ladder.get("rt_max", cfg["params"].rt_max)),
             manual_indexes=sorted(int(i) for i in ladder.get("manual", {})),
             absent_indexes=ladder.get("absent", []),
             selected_indexes=selected, source_file=ladder["path"],

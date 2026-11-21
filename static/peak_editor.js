@@ -1,4 +1,5 @@
-/* Page 1 peak editor: place ladder peaks by hand on one ladder card.
+/* Peak editor: place ladder peaks by hand on one ladder card. Used by both the
+   calibration app (page 1) and the main app (ladder step).
 
    Pick an index in the list, then click its peak on the chart. A click walks
    uphill on that index's own raw mass trace, the line drawn, to the top of the
@@ -6,8 +7,12 @@
    the peak goes where it is shown. Shift-click puts the peak on the clicked scan
    with no walk at all. Drag across the chart to zoom; "Whole run" zooms back out.
 
-   Shares the page's globals from calibrate.js: $, esc, state, cardId, ladderCard,
-   replaceLadder, showAlert. */
+   The page supplies what differs between the two apps as `opts`:
+     traces()        -> Promise of the ladder's traces JSON
+     save(picks)     -> Promise of the server's reply after saving the picks
+     rebuild(l)      -> a fresh card element for ladder entry `l` (on Cancel)
+     onSaved(card, d) after a save: swap in the re-analysed ladder
+     alert(title, items) to show a problem */
 
 const LADDER_COLORS = [
   "#0B5D6E", "#0E7C86", "#2E9B8F", "#6BB187",
@@ -17,26 +22,28 @@ const LADDER_COLORS = [
 const PE = { W: 900, H: 340, L: 58, R: 14, T: 22, B: 36 };
 const SVG_NS = "http://www.w3.org/2000/svg";
 
-function openPeakEditor(name) {
-  if (state.editing && state.editing !== name) {
-    showAlert("Finish the open peak edit first",
-      [`Save or cancel the peak changes on ${state.editing} before editing another ladder.`]);
+let PE_OPEN = null;        // name of the ladder being edited; one at a time
+
+function peakEditorOpen() { return PE_OPEN; }
+// a page that rebuilds every card at once forgets the open editor with it
+function resetPeakEditor() { PE_OPEN = null; }
+
+function openPeakEditor(card, l, opts) {
+  if (PE_OPEN && PE_OPEN !== l.name) {
+    opts.alert("Finish the open peak edit first",
+      [`Save or cancel the peak changes on ${PE_OPEN} before editing another ladder.`]);
     return;
   }
-  const card = $("ladder-card-" + cardId(name));
-  const l = state.ladders.find(x => x.name === name);
-  if (!card || !l) return;
   const button = card.querySelector("[data-role=edit-peaks]");
   if (button) { button.disabled = true; button.textContent = "Loading traces…"; }
-  fetch("/api/ladder/traces?name=" + encodeURIComponent(name))
-    .then(r => r.json()).then(t => {
-      if (t.error) throw new Error(t.error);
-      state.editing = name;
-      startEditor(card, l, t);
-    }).catch(e => {
-      if (button) { button.disabled = false; button.textContent = "Edit peaks"; }
-      showAlert(`Could not open the peak editor for ${name}`, [e.message]);
-    });
+  opts.traces().then(t => {
+    if (t.error) throw new Error(t.error);
+    PE_OPEN = l.name;
+    startEditor(card, l, t, opts);
+  }).catch(e => {
+    if (button) { button.disabled = false; button.textContent = "Edit peaks"; }
+    opts.alert(`Could not open the peak editor for ${l.name}`, [e.message]);
+  });
 }
 
 /* --------------------------------------------------------------- numbers */
@@ -67,10 +74,10 @@ function niceStep(span, target) {
 }
 
 /* ---------------------------------------------------------------- editor */
-function startEditor(card, l, t) {
+function startEditor(card, l, t, opts) {
   const n = t.rt.length;
   const ed = {
-    card, l, t,
+    card, l, t, opts,
     expected: l.expected,
     picks: {},            // index -> rt placed by hand, or null for "no peak"
     exact: new Set(l.exact || []),   // picks put on the clicked scan, unsnapped
@@ -159,8 +166,8 @@ function unbindKeys(ed) {
 
 function closeEditor(ed, entry) {
   unbindKeys(ed);
-  state.editing = null;
-  const fresh = ladderCard(entry || ed.l);
+  PE_OPEN = null;
+  const fresh = ed.opts.rebuild(entry || ed.l);
   ed.card.replaceWith(fresh);
   return fresh;
 }
@@ -460,19 +467,16 @@ function savePeaks(ed) {
   const button = ed.card.querySelector("[data-role=save]");
   button.disabled = true;
   status(ed, "Saving and re-plotting…");
-  fetch("/api/ladder/peaks", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: ed.l.name, picks: Object.fromEntries(
-      Object.entries(ed.picks).map(([k, v]) =>
-        [k, v !== null && ed.exact.has(Number(k)) ? { rt: v, exact: true } : v])) }),
-  }).then(r => r.json()).then(d => {
+  const picks = Object.fromEntries(Object.entries(ed.picks).map(([k, v]) =>
+    [k, v !== null && ed.exact.has(Number(k)) ? { rt: v, exact: true } : v]));
+  ed.opts.save(picks).then(d => {
     if (d.error) throw new Error(d.error);
     unbindKeys(ed);
-    state.editing = null;
-    replaceLadder(ed.card, d, `Peaks saved; ticks reset`);
+    PE_OPEN = null;
+    ed.opts.onSaved(ed.card, d);
   }).catch(e => {
     button.disabled = false;
     status(ed, "");
-    showAlert(`Could not save the peaks for ${ed.l.name}`, [e.message]);
+    ed.opts.alert(`Could not save the peaks for ${ed.l.name}`, [e.message]);
   });
 }
