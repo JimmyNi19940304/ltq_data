@@ -521,19 +521,35 @@ class Compound:
 
         `manual` maps a slot (1 or 2) to a pick as the ladder editor makes them:
         a time to snap to, {"rt": t, "exact": True}, or None for no peak.
-        `windows` maps a slot to (start, end) in this run's own minutes. Raises
-        ValueError, leaving the peaks as they were, when a window does not
-        contain its peak's top.
+        `windows` maps a slot to (start, end) in this run's own minutes. A window
+        set by hand decides its peak: the peak is the tallest raw scan inside it,
+        so sliding the window along the chromatogram carries the peak with it,
+        and any pick for that slot is set aside. Raises ValueError, leaving the
+        peaks as they were, when a window holds no scans.
         """
         manual = {int(k): v for k, v in (manual or {}).items()}
         windows = {int(k): (float(v[0]), float(v[1])) for k, v in (windows or {}).items()
                    if v is not None}
         peaks, dropped = [], []
         for slot in (1, 2):
-            if slot in manual:
+            auto = next((a for a in self.auto_peaks if a.slot == slot), None)
+            if slot in manual and manual[slot] is None:
+                continue                               # marked as no peak
+            if slot in windows:
+                start, end = windows[slot]
+                inside = np.flatnonzero((self.rt >= start) & (self.rt <= end))
+                if inside.size == 0:
+                    raise ValueError(
+                        f"The window for peak {slot} ({start:.2f}-{end:.2f} min) holds "
+                        "no scans. Move it onto the chromatogram.")
+                top = int(inside[np.argmax(self.tic[inside])])
+                pk = _measure_peak(self.rt, self.tic, self.smoothed,
+                                   climb(self.smoothed, top), self.params, raw_apex=top)
+                # still "automatic" if it is the automatic peak's own top
+                pk.manual = auto is None or auto.scan_index != top
+                pk.exact = False
+            elif slot in manual:
                 pick = manual[slot]
-                if pick is None:
-                    continue
                 exact = isinstance(pick, dict)
                 pk = snap_peak(self.rt, self.tic, self.params,
                                pick["rt"] if exact else pick, exact=exact)
@@ -541,7 +557,6 @@ class Compound:
                     dropped.append(slot)
                     continue
             else:
-                auto = next((a for a in self.auto_peaks if a.slot == slot), None)
                 if auto is None:
                     continue
                 pk = replace(auto)
@@ -551,10 +566,6 @@ class Compound:
             pk.auto_window = (start, end)
             if slot in windows:
                 start, end = windows[slot]
-                if not start <= pk.rt <= end:
-                    raise ValueError(
-                        f"The window for peak {slot} ({start:.2f}-{end:.2f} min) has to "
-                        f"contain the peak's top at {pk.rt:.2f} min.")
                 pk.window_manual = True
             pk.rt_start, pk.rt_end = float(start), float(end)
             inside = (self.rt >= pk.rt_start) & (self.rt <= pk.rt_end)
@@ -563,7 +574,9 @@ class Compound:
             peaks.append(pk)
 
         kept = {pk.slot for pk in peaks}
-        self.manual = {k: v for k, v in manual.items() if k not in dropped}
+        # a window set by hand carries its peak, so a pick under it is dropped
+        self.manual = {k: v for k, v in manual.items()
+                       if k not in dropped and (v is None or k not in windows)}
         self.windows = {k: v for k, v in windows.items() if k in kept}
         self.dropped = dropped
         self.peaks = peaks

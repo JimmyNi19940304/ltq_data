@@ -4,9 +4,12 @@
    Choose peak 1 or 2 on the right, then click its peak on the chart: the click
    walks uphill on the raw MS2 TIC to the top, as the server will; Shift-click
    puts it on the clicked scan. A placed peak gets the automatic N x FWHM window
-   again, measured on the smoothed trace exactly as the server measures it. Drag
-   a window's edge to widen or narrow it, or type its times. Drag anywhere else
-   to zoom.
+   again, measured on the smoothed trace exactly as the server measures it.
+
+   A window can also be moved: drag its middle to slide it, or its edges (or type
+   its times) to resize it. A window set that way decides its peak, which is the
+   tallest raw scan inside it, so the peak travels with the window. Drag outside
+   the windows to zoom.
 
    The chart is drawn on the standard ladder's time axis when there is one, but
    every time sent to the server is the run's own, so the windows pick the same
@@ -118,7 +121,8 @@ function startCompoundEditor(holder, n, t, opts) {
       <div class="ce-side">
         <h4>${escapeHtml(t.name)}: choose a peak, then click it</h4>
         <p class="note">◆ placed by hand, ◇ placed exactly (Shift-click). Windows start
-          at ${t.window_fwhm} × FWHM; drag a shaded edge, or type the times, to change one.
+          at ${t.window_fwhm} × FWHM. Drag a window's middle to move it, its edges or the
+          times below to resize it; the peak follows to the tallest point inside.
           Times are ${t.on_standard_axis ? "on the standard axis" : "the instrument's own"}.</p>
         <div data-role="rows"></div>
       </div>
@@ -169,17 +173,35 @@ function ceStatus(ed, text) {
 }
 
 /* Each present peak right now: its top scan and its window, in own time. */
+/* The tallest raw scan inside a window (own times), as the server picks it. */
+function tallestIn(t, w) {
+  let best = null;
+  for (let i = Math.max(0, nearestScan(t.rt, w[0]) - 1);
+       i < t.rt.length && t.rt[i] <= w[1]; i++) {
+    if (t.rt[i] < w[0]) continue;
+    if (best === null || t.tic[i] > t.tic[best]) best = i;
+  }
+  return best;
+}
+
 function cePeaks(ed) {
   const t = ed.t, out = {};
   for (const slot of [1, 2]) {
-    let time;
-    if (slot in ed.picks) {
-      if (ed.picks[slot] === null) continue;
-      time = ed.picks[slot];
-    } else if (t.auto[slot] !== undefined) {
-      time = t.auto[slot];
+    if (slot in ed.picks && ed.picks[slot] === null) continue;
+    const autoTop = t.auto[slot] !== undefined ? nearestScan(t.rt, t.auto[slot]) : null;
+    let top, manualPeak;
+    if (ed.windows[slot]) {
+      // a window set by hand carries its peak: the tallest scan inside it
+      top = tallestIn(t, ed.windows[slot]);
+      if (top === null) continue;
+      manualPeak = top !== autoTop;
+    } else if (slot in ed.picks) {
+      top = nearestScan(t.rt, ed.picks[slot]);
+      manualPeak = true;
+    } else if (autoTop !== null) {
+      top = autoTop;
+      manualPeak = false;
     } else continue;
-    const top = nearestScan(t.rt, time);
     const width = fwhmAt(t.rt, t.smooth, climbUphill(t.smooth, top)) ||
       2 * (t.rt[1] - t.rt[0]);
     const half = t.window_fwhm * width / 2;
@@ -188,7 +210,7 @@ function cePeaks(ed) {
       top, rt: t.rt[top], fwhm: width, auto,
       window: ed.windows[slot] || auto,
       manualWindow: !!ed.windows[slot],
-      manualPeak: slot in ed.picks,
+      manualPeak,
     };
   }
   return out;
@@ -222,7 +244,8 @@ function ceRenderRows(ed) {
     const row = document.createElement("div");
     row.className = "ce-row" + (ed.active === slot ? " active" : "") + (absent ? " absent" : "");
     const idx = pk ? ceIndex(ed, slot, pk) : null;
-    const mark = pk && pk.manualPeak ? (ed.exact.has(slot) ? "◇" : "◆") : "";
+    const mark = pk && pk.manualPeak
+      ? (ed.exact.has(slot) && !pk.manualWindow ? "◇" : "◆") : "";
     const fmt = (v) => ed.toAxis(v).toFixed(2);
     row.innerHTML = `
       <div class="ce-row-head">
@@ -232,7 +255,7 @@ function ceRenderRows(ed) {
         <button type="button" class="pe-x" data-act="absent" title="${absent
           ? "Use a peak here again" : "This compound has no peak " + slot}">${absent ? "+" : "×"}</button>
         <button type="button" class="pe-x" data-act="auto" title="Back to the automatic peak"
-          ${slot in ed.picks ? "" : "disabled"}>↺</button>
+          ${slot in ed.picks || ed.windows[slot] ? "" : "disabled"}>↺</button>
       </div>
       ${pk ? `
       <div class="ce-row-body">
@@ -267,7 +290,12 @@ function ceRenderRows(ed) {
     };
     const reset = row.querySelector("[data-act=window]");
     if (reset) reset.onclick = () => {
+      // the peak stays where the window put it; only the width goes back
       delete ed.windows[slot];
+      if (pk.manualPeak) {
+        ed.picks[slot] = Math.round(ed.t.rt[pk.top] * 1e5) / 1e5;
+        ed.exact.add(slot);
+      }
       ceStatus(ed, `Window ${slot} back to ${ed.t.window_fwhm} × FWHM`);
       ceRenderAll(ed);
     };
@@ -285,7 +313,7 @@ function ceRenderRows(ed) {
   const hint = ed.holder.querySelector("[data-role=hint]");
   hint.innerHTML = ed.active
     ? `Placing <b>peak ${ed.active}</b>. Click its top; Shift-click to place it exactly.
-       Drag a shaded edge to resize a window, drag elsewhere to zoom.`
+       Drag a window's middle to move it, an edge to resize it; drag outside to zoom.`
     : `Choose peak 1 or 2 on the right (or press 1 / 2), then click on the chart.`;
 }
 
@@ -295,14 +323,28 @@ function ceForget(ed, slot) {
   ed.exact.delete(slot);
 }
 
-/* Move one window edge, keeping the peak's top inside the window. */
+/* A window set by hand: from now on it decides where its peak is. */
+function setWindow(ed, slot, w) {
+  ed.windows[slot] = w.map(v => Math.round(v * 1e5) / 1e5);
+  delete ed.picks[slot];
+  ed.exact.delete(slot);
+}
+
+/* Move one window edge; the window stays at least a couple of scans wide. */
 function setEdge(ed, slot, pk, side, own) {
   const w = (ed.windows[slot] || pk.window).slice();
-  const step = (ed.t.rt[1] - ed.t.rt[0]) || 0.01;
+  const step = 2 * ((ed.t.rt[1] - ed.t.rt[0]) || 0.01);
   own = Math.min(Math.max(own, ed.t.rt[0]), ed.t.rt.at(-1));
-  w[side] = side === 0 ? Math.min(own, pk.rt - step / 4) : Math.max(own, pk.rt + step / 4);
-  w[side] = Math.round(w[side] * 1e5) / 1e5;
-  ed.windows[slot] = w;
+  w[side] = side === 0 ? Math.min(own, w[1] - step) : Math.max(own, w[0] + step);
+  setWindow(ed, slot, w);
+}
+
+/* Slide a whole window by `d` minutes on the chart's axis, from where the
+   drag started; it keeps its width and stays on the trace. */
+function moveWindow(ed, slot, base, d) {
+  const ax = ed.t.axis, a = ed.toAxis(base[0]), b = ed.toAxis(base[1]);
+  d = Math.min(Math.max(d, ax[0] - a), ax.at(-1) - b);
+  setWindow(ed, slot, [ed.toOwn(a + d), ed.toOwn(b + d)]);
 }
 
 function ceRender(ed) {
@@ -341,10 +383,12 @@ function ceRender(ed) {
   // windows under the trace, with grab handles on their edges
   const peaks = cePeaks(ed);
   ed.edges = [];
+  ed.bands = [];
   for (const [k, pk] of Object.entries(peaks)) {
     const slot = Number(k), c = CE_COLORS[slot];
     const a = sx(ed.toAxis(pk.window[0])), b = sx(ed.toAxis(pk.window[1]));
     const on = ed.drag && ed.drag.edge && ed.drag.edge.slot === slot;
+    ed.bands.push({ slot, a, b });
     g.push(`<rect x="${a}" y="${T}" width="${Math.max(1, b - a)}" height="${H - T - B}"
       fill="${c}" fill-opacity="${pk.manualWindow ? 0.17 : 0.1}"/>`);
     for (const [side, px] of [[0, a], [1, b]]) {
@@ -392,12 +436,15 @@ function ceRender(ed) {
     const edge = edgeAt(ed, ed.hoverX);
     g.push(`<line x1="${ed.hoverX}" x2="${ed.hoverX}" y1="${T}" y2="${H - B}" class="pe-hover"/>`);
     // one readout, top right, so the two never overlap
-    if (!edge && !ed.active) {
+    if (!edge && !ed.active && !bandAt(ed, ed.hoverX)) {
       parts.push(`<text x="${W - R}" y="${T - 8}" text-anchor="end" class="pe-readout">${time.toFixed(2)} min</text>`);
     }
     if (edge) {
       parts.push(`<text x="${W - R}" y="${T - 8}" text-anchor="end" class="pe-readout">
         ${time.toFixed(2)} min: drag to move the ${edge.side ? "end" : "start"} of window ${edge.slot}</text>`);
+    } else if (bandAt(ed, ed.hoverX) && !ed.active) {
+      parts.push(`<text x="${W - R}" y="${T - 8}" text-anchor="end" class="pe-readout">
+        ${time.toFixed(2)} min: drag to move window ${bandAt(ed, ed.hoverX).slot}</text>`);
     } else if (ed.active) {
       const s = ceSnap(ed, time, ed.shift);
       g.push(`<circle cx="${sx(ax[s])}" cy="${sy(y[s])}" r="5.5" class="pe-snap"/>`);
@@ -411,7 +458,17 @@ function ceRender(ed) {
   }
   g.push(`</g>`);
   ed.svg.innerHTML = parts.join("") + g.join("");
-  ed.svg.style.cursor = ed.hoverX !== null && edgeAt(ed, ed.hoverX) ? "ew-resize" : "";
+  const hx = ed.hoverX;
+  ed.svg.style.cursor = ed.drag && ed.drag.band && ed.drag.moved ? "grabbing"
+    : hx !== null && edgeAt(ed, hx) ? "ew-resize"
+    : hx !== null && bandAt(ed, hx) ? "grab" : "";
+}
+
+/* The window whose middle is under x: the one with the nearest centre. */
+function bandAt(ed, x) {
+  const hit = (ed.bands || []).filter(b => x > b.a && x < b.b)
+    .sort((p, q) => Math.abs(x - (p.a + p.b) / 2) - Math.abs(x - (q.a + q.b) / 2))[0];
+  return hit || null;
 }
 
 function edgeAt(ed, x) {
@@ -440,7 +497,10 @@ function ceBindPointer(ed) {
     if (ev.button !== 0) return;
     svg.setPointerCapture(ev.pointerId);
     const x = ceSvgX(ed, ev);
-    ed.drag = { start: x, now: x, y: ceSvgY(ed, ev), moved: false, edge: edgeAt(ed, x) };
+    const edge = edgeAt(ed, x), band = edge ? null : bandAt(ed, x);
+    const pk = band ? cePeaks(ed)[band.slot] : null;
+    ed.drag = { start: x, now: x, y: ceSvgY(ed, ev), moved: false, edge,
+                band: pk ? band : null, base: pk ? pk.window.slice() : null };
   });
   svg.addEventListener("pointermove", (ev) => {
     const x = ceSvgX(ed, ev);
@@ -449,7 +509,12 @@ function ceBindPointer(ed) {
     const d = ed.drag;
     if (d) {
       d.now = x;
-      if (Math.abs(x - d.start) > (d.edge ? 1 : 6)) d.moved = true;
+      if (Math.abs(x - d.start) > (d.edge ? 1 : d.band ? 3 : 6)) d.moved = true;
+      if (d.band && d.moved) {
+        moveWindow(ed, d.band.slot, d.base, ed.invX(x) - ed.invX(d.start));
+        ceRenderAll(ed);
+        return;
+      }
       if (d.edge && d.moved) {
         const pk = cePeaks(ed)[d.edge.slot];
         if (pk) setEdge(ed, d.edge.slot, pk, d.edge.side, ed.toOwn(ed.invX(x)));
@@ -466,6 +531,13 @@ function ceBindPointer(ed) {
     if (!d) return;
     if (d.edge) {
       if (d.moved) ceStatus(ed, `Window ${d.edge.slot} changed (not saved yet)`);
+      ceRenderAll(ed);
+      return;
+    }
+    if (d.band && d.moved) {
+      const pk = cePeaks(ed)[d.band.slot];
+      ceStatus(ed, pk ? `Window ${d.band.slot} moved; peak ${d.band.slot} at `
+        + `${ed.toAxis(pk.rt).toFixed(2)} min (not saved yet)` : "");
       ceRenderAll(ed);
       return;
     }
