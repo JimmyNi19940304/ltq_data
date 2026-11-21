@@ -520,7 +520,20 @@ $("to-compounds").onclick = () => {
 /* ============================================== step 3: chromatograms */
 function loadChromatograms() {
   return fetch(`/api/session/${state.session}/chromatograms`).then(r => r.json()).then(d => {
+    renderChromatograms(d);
+    showAlert("Check these before you continue", d.summary.warnings);
+    state.reached = 3;
+    reach(3);
+    goStep(3);
+  });
+}
+
+/* Step 3's figures, scale and tables. Also called after a compound's peaks are
+   edited, which makes any spectra built before stale. */
+function renderChromatograms(d) {
+    state.chrom = d;
     state.summary = d.summary;
+    resetCompoundEditor();
     const lad = d.summary.ladder;
 
     $("chrom-caption").textContent =
@@ -534,27 +547,45 @@ function loadChromatograms() {
     drawRuler(d.summary);
     for (const fig of d.figures) {
       let sub = "click to enlarge";
-      if (fig.kind === "compound") {
-        const c = d.summary.compounds.find(x => `Chromatogram of ${x.name}` === fig.title);
-        if (c && c.on_standard_axis) {
-          sub = c.peaks.map(p => `peak ${p.peak_no}: ${p.rt.toFixed(2)} min`).join("   ·   ");
-        } else if (c) {
-          sub = c.peaks.map(p =>
-            `${p.rt.toFixed(2)} min = index ${p.index === null ? "n/a" : p.index.toFixed(2)}`).join("   ·   ");
-        }
+      const c = fig.kind === "compound" ? d.summary.compounds[fig.compound] : null;
+      if (c) {
+        sub = c.peaks.map(p =>
+          `peak ${p.peak_no}: ${p.rt.toFixed(2)} min = index ${p.index === null ? "n/a" : p.index.toFixed(2)}`
+          + (p.manual || p.window_manual ? " ◆" : "")).join("   ·   ");
       }
-      plate(box, fig, sub);
+      if (!c) { plate(box, fig, sub); continue; }
+      const holder = document.createElement("div");
+      holder.className = "ce-holder";
+      box.appendChild(holder);
+      plate(holder, fig, sub);
+      const bar = document.createElement("div");
+      bar.className = "ce-open";
+      bar.innerHTML = `<span class="note">Spectrum windows: ${c.window_fwhm} × FWHM unless set by
+        hand. Index ${c.index_from === "standard" ? "read off the standard ladder" : "from this run's ladder"}.</span>
+        <button type="button" class="ghost small" data-role="edit-compound">Edit peaks and windows</button>`;
+      holder.appendChild(bar);
+      bar.querySelector("button").onclick = () => openCompoundEditor(holder, fig.compound, {
+        trace: () => fetch(api(`/compound/${fig.compound}/trace`)).then(r => r.json()),
+        save: (body) => fetch(api(`/compound/${fig.compound}/peaks`), {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(r => r.json()),
+        close: (reply) => {
+          if (!reply) return renderChromatograms(state.chrom);
+          renderChromatograms(reply);
+          showAlert("Check these before you continue", reply.summary.warnings);
+          // the spectra and the download were built from the old windows
+          state.reached = Math.min(state.reached, 3);
+          reach(3);
+        },
+        alert: (title, items) => showAlert(title, items),
+      });
     }
 
     buildTables(d.summary);
-    showAlert("Check these before you continue", d.summary.warnings);
     // the scans behind the spectra just changed, so anything downstream is stale
     state.spectraFresh = false;
     state.exportFresh = false;
-    state.reached = 3;
-    reach(3);
-    goStep(3);
-  });
 }
 
 function renderAxisBanner(summary) {
@@ -590,7 +621,7 @@ function drawRuler(summary) {
   const rts = lad.map(p => p.rt);
   let lo = Math.min(...rts), hi = Math.max(...rts);
   for (const c of summary.compounds) for (const p of c.peaks) {
-    lo = Math.min(lo, p.rt); hi = Math.max(hi, p.rt);
+    lo = Math.min(lo, p.rt_raw); hi = Math.max(hi, p.rt_raw);
   }
   const pad = (hi - lo) * 0.06 || 1;
   lo -= pad; hi += pad;
@@ -608,7 +639,8 @@ function drawRuler(summary) {
   const lanes = [];
   for (const c of summary.compounds) {
     for (const p of c.peaks) {
-      const px = x(p.rt);
+      // this run's own time, the scale the ladder ticks are drawn on
+      const px = x(p.rt_raw);
       let lane = 0;
       while (lanes[lane] !== undefined && px - lanes[lane] < 96) lane++;
       lanes[lane] = px;
@@ -639,15 +671,15 @@ function buildTables(summary) {
   const rtHead = onStd ? `RT on ${escapeHtml(summary.standard.name)} (min)` : "RT (min)";
   html += `<div class="table-wrap"><table><caption>Compound peaks</caption>
     <thead><tr><th>Compound</th><th>Nominal mass</th><th>MS2 precursor</th><th>Peak</th>
-    <th>${rtHead}</th>${onStd ? "" : "<th>Index</th>"}
+    <th>${rtHead}</th><th>Index</th>
     <th>Window (min)</th><th>MS levels</th></tr></thead><tbody>`;
   for (const c of summary.compounds) {
     for (const p of c.peaks) {
       html += `<tr class="${p.extrapolated ? "flag" : ""}">
         <td>${escapeHtml(c.name)}</td><td>${c.nominal_mass ?? ""}</td><td>${c.ms2_precursor ?? ""}</td>
         <td>${p.peak_no}</td><td>${p.rt.toFixed(2)}${p.extrapolated ? " *" : ""}</td>
-        ${onStd ? "" : `<td>${p.index === null ? "n/a" : p.index.toFixed(2)}</td>`}
-        <td>${p.rt_start.toFixed(2)}–${p.rt_end.toFixed(2)}</td>
+        <td>${p.index === null ? "n/a" : p.index.toFixed(2)}${p.manual ? " ◆" : ""}</td>
+        <td>${p.rt_start.toFixed(2)}–${p.rt_end.toFixed(2)}${p.window_manual ? " ◆" : ""}</td>
         <td>${c.ms_levels.join(", ")}</td></tr>`;
     }
   }
@@ -662,7 +694,7 @@ $("say-no").onclick = () => {
     "Adjust the m/z tolerance if a ladder trace looks noisy or empty.",
     "Raise the minimum peak height to skip shoulders, or lower it if a real peak was missed.",
     "Check each compound's nominal mass against the MS2 precursor found in the file.",
-    "Adjust the peak window height if the shaded region misses part of a peak.",
+    "Use Edit peaks and windows on a chromatogram to move a peak or resize its shaded window.",
   ]);
   goStep(1);
 };

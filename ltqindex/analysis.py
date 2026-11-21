@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields as dataclass_fields
+from dataclasses import asdict, dataclass, fields as dataclass_fields, replace
 from typing import List, Optional
 
 import numpy as np
@@ -21,7 +21,8 @@ class Params:
     min_rel_height: float = 0.05    # peak height, as a fraction of the trace maximum
     min_rel_prominence: float = 0.05
     min_separation: int = 3         # minimum scans between two peaks
-    window_rel_height: float = 0.9  # 0.9 = accumulate across almost the whole peak
+    window_rel_height: float = 0.9  # ladder peak edges: 0.9 = almost the whole peak
+    window_fwhm: float = 2.0        # compound spectrum window, in FWHMs centred on the top
     spectrum_mz_tolerance: float = 0.3   # merge peaks this close when averaging scans
     spectrum_label_count: int = 12
     spectrum_label_min_rel: float = 0.02
@@ -47,6 +48,7 @@ class Params:
         p.smooth_window = max(1, p.smooth_window)
         p.min_separation = max(1, p.min_separation)
         p.window_rel_height = min(0.95, max(0.05, p.window_rel_height))
+        p.window_fwhm = min(10.0, max(0.1, p.window_fwhm))
         return p
 
     to_dict = asdict
@@ -69,6 +71,9 @@ class Peak:
     slot: Optional[int] = None      # 0 or 1: first or second peak of its ladder mass
     manual: bool = False            # placed by hand rather than by peak picking
     exact: bool = False             # placed on the clicked scan, without snapping
+    fwhm: Optional[float] = None    # compound peaks: full width at half maximum, min
+    auto_window: Optional[tuple] = None  # compound peaks: the N x FWHM window
+    window_manual: bool = False     # compound peaks: window edges set by hand
 
     to_dict = asdict
 
@@ -146,6 +151,62 @@ def climb(ys, start):
             i -= 1
         else:
             return i
+
+
+def fwhm_at(rt, ys, apex):
+    """Full width at half maximum of the smoothed peak whose top is scan `apex`.
+
+    Each side is walked down until the trace drops to half the top, and the
+    crossing is interpolated between scans. A side that reaches a valley first,
+    where the trace starts to rise again, stops at the valley, so the width never
+    runs into a neighbouring peak. The browser editor runs the same walk.
+    """
+    half = ys[apex] / 2.0
+
+    def edge(step):
+        i = apex
+        while 0 <= i + step < ys.size:
+            j = i + step
+            if ys[j] <= half:
+                drop = ys[i] - ys[j]
+                f = (ys[i] - half) / drop if drop > 0 else 0.0
+                return rt[i] + f * (rt[j] - rt[i])
+            if ys[j] > ys[i]:
+                return rt[i]
+            i = j
+        return rt[i]
+
+    return float(edge(1) - edge(-1))
+
+
+def fwhm_window(rt, ys, top, n_fwhm):
+    """(start, end, fwhm): a window n_fwhm x FWHM wide, centred on scan `top`.
+
+    The width is measured on the smoothed peak under `top`; the centre is the
+    reported (raw) top itself. Clipped to the trace.
+    """
+    width = fwhm_at(rt, ys, climb(ys, top))
+    if width <= 0:
+        width = 2 * (float(np.median(np.diff(rt))) if rt.size > 1 else 0.01)
+    half = n_fwhm * width / 2.0
+    centre = float(rt[top])
+    return max(float(rt[0]), centre - half), min(float(rt[-1]), centre + half), width
+
+
+def interp_index(rts, idx, rt):
+    """(index, extrapolated) for a retention time, by linear interpolation
+    between the bracketing ladder points: halfway between index 9 and 10 is 9.5.
+    Outside the points the two nearest are extrapolated and the result flagged."""
+    rts, idx = np.asarray(rts, float), np.asarray(idx, float)
+    if rts.size < 2 or rt is None:
+        return None, False
+    if rts[0] <= rt <= rts[-1]:
+        return float(np.interp(rt, rts, idx)), False
+    if rt < rts[0]:
+        slope = (idx[1] - idx[0]) / (rts[1] - rts[0])
+        return float(idx[0] + slope * (rt - rts[0])), True
+    slope = (idx[-1] - idx[-2]) / (rts[-1] - rts[-2])
+    return float(idx[-1] + slope * (rt - rts[-1])), True
 
 
 def snap_peak(rt, y, params: Params, target_rt, exact=False) -> Optional[Peak]:
@@ -310,16 +371,7 @@ class Ladder:
         Outside the calibrated range the two nearest points are extrapolated, and
         the result is flagged so the figures can mark it.
         """
-        rts, idx = self.calibration
-        if rts.size < 2:
-            return None, False
-        if rts[0] <= rt <= rts[-1]:
-            return float(np.interp(rt, rts, idx)), False
-        if rt < rts[0]:
-            slope = (idx[1] - idx[0]) / (rts[1] - rts[0])
-            return float(idx[0] + slope * (rt - rts[0])), True
-        slope = (idx[-1] - idx[-2]) / (rts[-1] - rts[-2])
-        return float(idx[-1] + slope * (rt - rts[-1])), True
+        return interp_index(*self.calibration, rt)
 
     def table(self):
         rows = []
@@ -411,7 +463,17 @@ def analyse_ladder(run: Run, masses, params: Params, limit=None, manual=None,
 
 # ----------------------------------------------------------------- compound
 class Compound:
-    def __init__(self, run: Run, name, nominal_mass, params: Params, ladder: Ladder):
+    """One compound run: its MS2 chromatogram, its two peaks and their windows.
+
+    The two peaks are numbered 1 and 2 by the tallest-peak pick, in retention
+    time order. Either can be placed by hand or marked as absent, and each one's
+    spectrum window is `window_fwhm` x FWHM centred on its top unless its edges
+    were set by hand. Times are kept on the instrument's own axis throughout;
+    the standard axis is only a relabelling for display and indexing.
+    """
+
+    def __init__(self, run: Run, name, nominal_mass, params: Params, ladder: Ladder,
+                 manual=None, windows=None):
         self.run = run
         self.name = name
         self.nominal_mass = nominal_mass
@@ -431,9 +493,10 @@ class Compound:
         self.rt = ms2.rt[:n]
         self.tic = ms2.tic[:n]
         self.smoothed = smooth(self.tic, params.smooth_window)
-        self.peaks = pick_peaks(self.rt, self.tic, params, n_peaks=2)
-        for pk in self.peaks:
-            pk.index, pk.index_extrapolated = ladder.to_index(pk.rt)
+        self.ladder = ladder
+        self.auto_peaks = pick_peaks(self.rt, self.tic, params, n_peaks=2)
+        for slot, pk in enumerate(self.auto_peaks, start=1):
+            pk.slot = slot
 
         chain = parse_filter(ms2.filters[0]) if ms2.filters else []
         self.precursor_mz = chain[0][0] if chain else None
@@ -442,24 +505,113 @@ class Compound:
 
         # set by set_transform when a standard ladder is available
         self.transform = None
+        self.index_scale = None       # the standard ladder's (rts, indexes)
         self.rt_standard = None
         self.transform_warning = None
 
+        self.manual = {}              # slot -> hand pick, or None for "no peak"
+        self.windows = {}             # slot -> (start, end) set by hand, own times
+        self.dropped = []
+        self.peaks = []
+        self.set_edits(manual, windows)
+
+    # ---------------------------------------------------------- hand edits
+    def set_edits(self, manual=None, windows=None):
+        """Rebuild both peaks from the automatic pick plus any hand edits.
+
+        `manual` maps a slot (1 or 2) to a pick as the ladder editor makes them:
+        a time to snap to, {"rt": t, "exact": True}, or None for no peak.
+        `windows` maps a slot to (start, end) in this run's own minutes. Raises
+        ValueError, leaving the peaks as they were, when a window does not
+        contain its peak's top.
+        """
+        manual = {int(k): v for k, v in (manual or {}).items()}
+        windows = {int(k): (float(v[0]), float(v[1])) for k, v in (windows or {}).items()
+                   if v is not None}
+        peaks, dropped = [], []
+        for slot in (1, 2):
+            if slot in manual:
+                pick = manual[slot]
+                if pick is None:
+                    continue
+                exact = isinstance(pick, dict)
+                pk = snap_peak(self.rt, self.tic, self.params,
+                               pick["rt"] if exact else pick, exact=exact)
+                if pk is None:
+                    dropped.append(slot)
+                    continue
+            else:
+                auto = next((a for a in self.auto_peaks if a.slot == slot), None)
+                if auto is None:
+                    continue
+                pk = replace(auto)
+            pk.slot = slot
+            start, end, pk.fwhm = fwhm_window(self.rt, self.smoothed, pk.scan_index,
+                                              self.params.window_fwhm)
+            pk.auto_window = (start, end)
+            if slot in windows:
+                start, end = windows[slot]
+                if not start <= pk.rt <= end:
+                    raise ValueError(
+                        f"The window for peak {slot} ({start:.2f}-{end:.2f} min) has to "
+                        f"contain the peak's top at {pk.rt:.2f} min.")
+                pk.window_manual = True
+            pk.rt_start, pk.rt_end = float(start), float(end)
+            inside = (self.rt >= pk.rt_start) & (self.rt <= pk.rt_end)
+            pk.area = (float(np.trapezoid(self.tic[inside], self.rt[inside]))
+                       if inside.sum() > 1 else 0.0)
+            peaks.append(pk)
+
+        kept = {pk.slot for pk in peaks}
+        self.manual = {k: v for k, v in manual.items() if k not in dropped}
+        self.windows = {k: v for k, v in windows.items() if k in kept}
+        self.dropped = dropped
+        self.peaks = peaks
+        self._place()
+
+    @property
+    def absent(self):
+        """Slots the operator marked as having no peak."""
+        return [k for k, v in self.manual.items() if v is None]
+
+    def _place(self):
+        """Standard-axis times and ladder index for every peak.
+
+        With a standard, a peak's time is put on the standard's axis and its
+        index is read off the standard ladder there; without one, the index comes
+        from this run's own ladder.
+        """
+        t = self.transform
+        for pk in self.peaks:
+            if t is None:
+                pk.rt_standard = pk.rt_standard_start = pk.rt_standard_end = None
+                pk.rt_extrapolated = False
+            else:
+                pk.rt_standard = float(t(pk.rt))
+                pk.rt_standard_start = float(t(pk.rt_start))
+                pk.rt_standard_end = float(t(pk.rt_end))
+                pk.rt_extrapolated = not t.is_inside(pk.rt)
+            if t is not None and self.index_scale is not None:
+                pk.index, pk.index_extrapolated = interp_index(*self.index_scale,
+                                                               pk.rt_standard)
+            else:
+                pk.index, pk.index_extrapolated = self.ladder.to_index(pk.rt)
+
     # ----------------------------------------------------- standard time axis
-    def set_transform(self, transform):
+    def set_transform(self, transform, index_scale=None):
         """Put this compound on the standard ladder's time axis.
 
         Only the reported times move. Scan selection for the mass spectra still
         uses the instrument's own retention times, so which scans go into a
-        spectrum is unchanged.
+        spectrum is unchanged. `index_scale` is the standard ladder's
+        (retention times, indexes), from which each peak's index is read.
         """
         self.transform = transform
+        self.index_scale = index_scale
         self.transform_warning = None
         if transform is None:
             self.rt_standard = None
-            for pk in self.peaks:
-                pk.rt_standard = None
-                pk.rt_standard_start = pk.rt_standard_end = None
+            self._place()
             return
 
         check = transform.check_monotonic(float(self.rt[0]), float(self.rt[-1]))
@@ -470,11 +622,7 @@ class Compound:
                 "Times past that point would be out of order. Use a lower-degree model."
             )
         self.rt_standard = transform(self.rt)
-        for pk in self.peaks:
-            pk.rt_standard = float(transform(pk.rt))
-            pk.rt_standard_start = float(transform(pk.rt_start))
-            pk.rt_standard_end = float(transform(pk.rt_end))
-            pk.rt_extrapolated = not transform.is_inside(pk.rt)
+        self._place()
 
     @property
     def on_standard_axis(self):
@@ -503,7 +651,12 @@ class Compound:
                     "range the transform was fitted over, so its standard-axis time is "
                     "extrapolated."
                 )
-        if len(self.peaks) < 2:
+        for slot in self.dropped:
+            out.append(f"{self.name}: the hand-placed peak {slot} lies past the "
+                       "retention-time limit, so its automatic peak is used.")
+        if len(self.peaks) == 2 and self.peaks[0].rt >= self.peaks[1].rt:
+            out.append(f"{self.name}: peak 1 is not earlier than peak 2.")
+        if len(self.peaks) + len(self.absent) < 2:
             out.append(
                 f"{self.name}: only {len(self.peaks)} peak(s) found in the MS2 chromatogram. "
                 "Lower the minimum peak height or check the file."
@@ -515,7 +668,12 @@ class Compound:
                     f"match the MS2 precursor in the file ({self.precursor_mz:g})."
                 )
         for pk in self.peaks:
-            if pk.index_extrapolated and not self.on_standard_axis:
+            if pk.index_extrapolated and self.on_standard_axis and self.index_scale:
+                out.append(
+                    f"{self.name}: peak {pk.slot} lies outside the standard ladder's "
+                    "indexes, so its index is extrapolated."
+                )
+            elif pk.index_extrapolated and not self.on_standard_axis:
                 out.append(
                     f"{self.name}: the peak at {pk.rt:.2f} min falls outside the ladder "
                     "retention-time range, so its index is extrapolated."
@@ -527,7 +685,10 @@ class Compound:
         no standard has been saved yet."""
         if self.on_standard_axis:
             flag = "*" if getattr(pk, "rt_extrapolated", False) else ""
-            return f"{pk.rt_standard:.2f} min{flag}"
+            label = f"{pk.rt_standard:.2f} min{flag}"
+            if pk.index is not None:
+                label += f"\nindex {pk.index:.2f}" + ("*" if pk.index_extrapolated else "")
+            return label
         if pk.index is None:
             return "index n/a"
         return f"index {pk.index:.2f}" + ("*" if pk.index_extrapolated else "")
@@ -542,9 +703,9 @@ class Compound:
 
     def window_of(self, rt):
         """Which chromatogram peak window a retention time falls in, 0 if none."""
-        for n, pk in enumerate(self.peaks, start=1):
+        for pk in self.peaks:
             if pk.rt_start <= rt <= pk.rt_end:
-                return n
+                return pk.slot
         return 0
 
     def _channels(self):
@@ -605,7 +766,8 @@ class Compound:
         against each other, and against the same compound in another run.
         """
         out = []
-        for n, pk in enumerate(self.peaks, start=1):
+        for pk in self.peaks:
+            n = pk.slot
             for level, lv, key, scan_idx in self._channels():
                 spec = self._spectrum(
                     level, lv, key, scan_idx,

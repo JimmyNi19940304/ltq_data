@@ -17,6 +17,7 @@ from werkzeug.utils import secure_filename
 from ltqindex.analysis import DEFAULT_LADDER_MASSES, Params, analyse_ladder
 from ltqindex.calibration import MODELS, ConfigError, load_config
 from ltqindex.standards import StandardError_, folders, load_standard
+from ltqindex.compoundedit import trace_payload
 from ltqindex.ladderedit import traces_payload
 from ltqindex.msdata import load_run
 from ltqindex.pipeline import Job, Session, safe_name
@@ -215,7 +216,12 @@ def create_session():
             return jsonify({"error": f"Nominal mass for {name} is not a number."}), 400
         if nominal is None:
             return jsonify({"error": f"Enter the nominal mass for {name}."}), 400
-        session.compound_specs.append({"path": path, "name": name, "nominal_mass": nominal})
+        upload = request.files.get(f"compound_file_{i}")
+        # the file's own name keys its hand-placed peaks and windows
+        file_name = (upload.filename if upload is not None and upload.filename
+                     else Path(request.form.get(f"compound_path_{i}", "").strip()).name)
+        session.compound_specs.append({"path": path, "name": name, "nominal_mass": nominal,
+                                       "file": file_name})
 
     names = [c["name"] for c in session.compound_specs]
     if len(set(names)) != len(names):
@@ -348,6 +354,33 @@ def compounds(sid):
     return jsonify({"job": job.id})
 
 
+def _compound(session, n):
+    try:
+        return session.compound(n)
+    except LookupError as exc:
+        abort(404, description=str(exc))
+
+
+@app.get("/api/session/<sid>/compound/<int:n>/trace")
+def compound_trace(sid, n):
+    """The MS2 TIC and peaks the compound peak editor draws."""
+    session = get_session(sid)
+    return jsonify(trace_payload(_compound(session, n)))
+
+
+@app.post("/api/session/<sid>/compound/<int:n>/peaks")
+def compound_peaks(sid, n):
+    """Save hand-placed peaks and windows for one compound and redraw it."""
+    session = get_session(sid)
+    _compound(session, n)
+    payload = request.get_json(silent=True) or {}
+    try:
+        session.set_compound_edits(n, payload.get("peaks"), payload.get("windows"))
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"figures": session.chromatogram_figures, "summary": session.summary()})
+
+
 @app.post("/api/session/<sid>/confirm")
 def confirm(sid):
     """The gate from the requirement: only past a yes do the spectra get made."""
@@ -363,7 +396,7 @@ def confirm(sid):
                 "Widen or narrow the m/z tolerance if a trace looks noisy or empty.",
                 "Raise the minimum peak height to skip shoulders, or lower it if a real peak was missed.",
                 "Check each compound's nominal mass against the MS2 precursor reported in the file.",
-                "Adjust the peak window if the shaded region does not cover the peak you want to average.",
+                "Use Edit peaks and windows on a chromatogram to move a peak or resize its shaded window.",
             ],
         })
     session.confirmed = True

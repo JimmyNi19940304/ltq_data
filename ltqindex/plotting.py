@@ -160,8 +160,11 @@ def plot_compound(compound, path=None, formats=("png",)):
     for pk in compound.peaks:
         apex, start, end = compound.axis_peak(pk)
         y = pk.height / scale
-        ax.axvspan(start, end, color=MARK, alpha=0.14, zorder=1)
-        ax.plot([apex], [y], marker="v", ms=4, color=MARK, zorder=4)
+        ax.axvspan(start, end, color=MARK, alpha=0.14, zorder=1,
+                   hatch="////" if pk.window_manual else None, ec=MARK if pk.window_manual else None,
+                   lw=0)
+        ax.plot([apex], [y], marker="D" if pk.manual else "v", ms=4.5 if pk.manual else 4,
+                color=MARK, zorder=4)
         ax.annotate(compound.peak_label(pk),
                     xy=(apex, y), xytext=(0, 9), textcoords="offset points",
                     ha="center", fontsize=8.5, color=MARK, fontweight="600",
@@ -185,11 +188,23 @@ def plot_compound(compound, path=None, formats=("png",)):
             subtitle += "   |   * extrapolated beyond the ladder"
     if compound.params.rt_max and compound.params.rt_max > 0:
         subtitle += f"   |   scans after {compound.params.rt_max:g} min ignored"
+    notes = [f"windows {compound.params.window_fwhm:g} x FWHM"]
+    if standard and compound.index_scale:
+        notes.append("index from the standard ladder")
+    if any(p.manual for p in compound.peaks):
+        notes.append("◆ placed by hand")
+    if any(p.window_manual for p in compound.peaks):
+        notes.append("hatched window set by hand")
+    if compound.absent:
+        notes.append("no peak " + ", ".join(map(str, compound.absent)))
+    # inside the axes, top right: the subtitle above has room for one line only
+    ax.text(0.995, 0.97, "   |   ".join(notes), transform=ax.transAxes,
+            fontsize=7.5, color=MUTED, ha="right", va="top")
 
     ax.set_xlabel(f"Retention time on the {compound.transform.standard_name} axis (min)"
                   if standard else "Retention time (min)")
     ax.set_ylabel("MS2 total ion current" + unit)
-    ax.set_ylim(0, top / scale * 1.26)
+    ax.set_ylim(0, top / scale * 1.45)
     ax.set_xlim(rt[0], rt[-1])
     _header(ax, f"Chromatogram of {compound.name}", subtitle)
     written = _finish(fig, ax, path, formats)

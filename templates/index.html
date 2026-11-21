@@ -112,8 +112,8 @@
             <input type="number" name="min_rel_prominence" class="mono" step="0.01" min="0" max="1" value="0.05"></label>
           <label class="field"><span>Peak separation (scans)</span>
             <input type="number" name="min_separation" class="mono" step="1" min="1" value="3"></label>
-          <label class="field"><span>Peak window height</span>
-            <input type="number" name="window_rel_height" class="mono" step="0.05" min="0.05" max="0.95" value="0.9"></label>
+          <label class="field"><span>Spectrum window (× FWHM)</span>
+            <input type="number" name="window_fwhm" class="mono" step="0.1" min="0.1" max="10" value="2"></label>
           <label class="field"><span>Spectrum merge (Da)</span>
             <input type="number" name="spectrum_mz_tolerance" class="mono" step="0.05" min="0.05" value="0.3"></label>
           <label class="field"><span>Labels per spectrum</span>
@@ -121,9 +121,9 @@
         </div>
         <p class="note">Scans after the retention-time limit are dropped before
         anything else happens, so nothing past it reaches a chromatogram, a peak or a
-        spectrum. Set it to 0 to keep the whole run. Peak window height sets where the
-        accumulation window is cut: 0.9 takes nearly the whole peak, 0.5 would be the
-        width at half maximum.</p>
+        spectrum. Set it to 0 to keep the whole run. Each compound peak's spectrum window
+        starts this many widths at half maximum wide, centred on the peak's top; it can
+        be dragged wider or narrower on the chromatogram afterwards.</p>
       </details>
 
       <div class="panel-actions">
@@ -231,5 +231,6 @@
 <div class="lightbox hidden" id="lightbox"><img alt="" id="lightbox-img"></div>
 <script src="/static/app.js"></script>
 <script src="/static/peak_editor.js"></script>
+<script src="/static/compound_editor.js"></script>
 </body>
 </html>

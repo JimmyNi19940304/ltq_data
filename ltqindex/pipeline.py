@@ -15,10 +15,12 @@ from pathlib import Path
 
 from .analysis import Compound, Params, analyse_ladder, DEFAULT_LADDER_MASSES
 from .calibration import calibrate
+from .compoundedit import load_overrides as load_compound_edits, parse_edits, store_edits
 from .ladderedit import (ladder_entry, load_overrides, parse_picks, parse_rt_max,
                          saved_picks, store_override, with_rt_max)
 from .msdata import load_run
-from .standards import StandardError_, build_transform, compound_output_dir, load_standard
+from .standards import (StandardError_, build_transform, compound_output_dir, index_scale,
+                        load_standard)
 from .plotting import plot_compound, plot_fit, plot_ladder, plot_spectrum
 
 EXPORT_FORMATS = ("png", "pdf")
@@ -333,6 +335,8 @@ class Session:
         n_files = len(self.compound_specs)
         step = 0.76 / max(1, n_files)
 
+        saved = (load_compound_edits(self.overrides_folder)
+                 if self.overrides_folder else {})
         self.compounds = []
         for i, spec in enumerate(self.compound_specs):
             base = 0.02 + step * i
@@ -342,28 +346,75 @@ class Session:
                 progress=lambda m, b=base: job.update(m, min(b + step * 0.8, 0.78)),
             )
             job.update(f"Building the MS2 chromatogram for {spec['name']}", base + step * 0.9)
-            compound = Compound(run, spec["name"], spec["nominal_mass"], self.params, self.ladder)
-            compound.set_transform(self.transform)
+            edits = saved.get(spec.get("file") or "", {})
+            try:
+                compound = Compound(run, spec["name"], spec["nominal_mass"], self.params,
+                                    self.ladder, manual=edits.get("peaks"),
+                                    windows=edits.get("windows"))
+            except ValueError:
+                if not edits:
+                    raise
+                # saved windows that no longer hold their peak are let go
+                compound = Compound(run, spec["name"], spec["nominal_mass"], self.params,
+                                    self.ladder, manual=edits.get("peaks"))
+            compound.file = spec.get("file") or ""
+            compound.set_transform(self.transform,
+                                   index_scale(self.standard) if self.transform else None)
             self.compounds.append(compound)
 
         job.update("Drawing chromatograms", 0.80, "plotting")
         self.chromatogram_figures = []
         for f in self.figures.glob("chrom_*"):
             f.unlink()
-        for c in self.compounds:
-            cstem = self.figures / f"chrom_compound_{safe_name(c.name)}"
-            plot_compound(c, cstem, formats=("png",))
-            self.chromatogram_figures.append(
-                {
-                    "key": cstem.name,
-                    "title": f"Chromatogram of {c.name}",
-                    "kind": "compound",
-                    "file": cstem.name + ".png",
-                }
-            )
+        for n, c in enumerate(self.compounds):
+            self.chromatogram_figures.append(self._plot_compound(n))
         self.confirmed = False
         job.update("Chromatograms ready for review", 1.0, "review")
         job.done = True
+
+    def _plot_compound(self, n):
+        c = self.compounds[n]
+        cstem = self.figures / f"chrom_compound_{safe_name(c.name)}"
+        plot_compound(c, cstem, formats=("png",))
+        return {
+            "key": cstem.name,
+            "title": f"Chromatogram of {c.name}",
+            "kind": "compound",
+            "compound": n,
+            "file": cstem.name + ".png",
+        }
+
+    def compound(self, n):
+        if not 0 <= n < len(self.compounds):
+            raise LookupError(f"There is no compound {n + 1}.")
+        return self.compounds[n]
+
+    def set_compound_edits(self, n, raw_peaks, raw_windows):
+        """Hand-placed peaks and windows for compound n. Raises ValueError with
+        a message, leaving the compound as it was."""
+        with self.lock:
+            c = self.compound(n)
+            peaks, windows = parse_edits(raw_peaks, raw_windows)
+            c.set_edits(peaks, windows)
+            if c.dropped:
+                dropped = c.dropped
+                c.set_edits(*parse_edits(*self._saved_edits(c)))
+                raise ValueError("Peak " + ", ".join(map(str, dropped))
+                                 + " was placed past the retention time limit.")
+            self.chromatogram_figures = [
+                self._plot_compound(n) if f.get("compound") == n else f
+                for f in self.chromatogram_figures
+            ]
+            if self.overrides_folder and c.file:
+                store_edits(self.overrides_folder, c.file, c.manual, c.windows)
+            # the scans behind this compound's spectra just changed
+            self.confirmed = False
+            self.spectrum_figures = []
+
+    def _saved_edits(self, c):
+        saved = (load_compound_edits(self.overrides_folder).get(c.file, {})
+                 if self.overrides_folder and c.file else {})
+        return saved.get("peaks"), saved.get("windows")
 
     def run_spectra(self, job: Job):
         with self.lock:
@@ -431,9 +482,17 @@ class Session:
                     "activation": c.activation,
                     "ms_levels": c.run.available_levels,
                     "on_standard_axis": c.on_standard_axis,
+                    "index_from": ("standard" if c.on_standard_axis and c.index_scale
+                                   else "ladder"),
+                    "absent": c.absent,
+                    "window_fwhm": c.params.window_fwhm,
                     "peaks": [
                         {
-                            "peak_no": i,
+                            "peak_no": pk.slot,
+                            "manual": pk.manual,
+                            "exact": pk.exact,
+                            "window_manual": pk.window_manual,
+                            "fwhm": round(pk.fwhm, 5) if pk.fwhm else None,
                             "rt": round(pk.rt_standard, 4) if c.on_standard_axis
                                   else round(pk.rt, 4),
                             "rt_raw": round(pk.rt, 4),
@@ -451,7 +510,7 @@ class Session:
                             "rt_start_raw": round(pk.rt_start, 4),
                             "rt_end_raw": round(pk.rt_end, 4),
                         }
-                        for i, pk in enumerate(c.peaks, start=1)
+                        for pk in c.peaks
                     ],
                 }
                 for c in self.compounds
@@ -565,14 +624,16 @@ class Session:
             rt_col = "rt_standard_min" if on_std else "rt_min"
             w.writerow(["compound", "run", "standard", "transform_model",
                         "nominal_mass", "ms2_precursor", "peak_no",
-                        rt_col, "extrapolated", "height", "area",
-                        "window_start_min", "window_end_min",
+                        rt_col, "extrapolated", "index", "index_from",
+                        "height", "area", "window_start_min", "window_end_min",
+                        "fwhm_min", "peak_by_hand", "window_by_hand",
                         "area_fraction", "height_fraction"])
             for c in self.compounds:
                 ratios = c.peak_ratios() or {}
                 std = c.transform.standard_name if c.on_standard_axis else ""
                 model = c.transform.model if c.on_standard_axis else ""
-                for n, pk in enumerate(c.peaks, start=1):
+                for pk in c.peaks:
+                    n = pk.slot
                     shown = pk.rt_standard if c.on_standard_axis else pk.rt
                     start = pk.rt_standard_start if c.on_standard_axis else pk.rt_start
                     end = pk.rt_standard_end if c.on_standard_axis else pk.rt_end
@@ -581,8 +642,11 @@ class Session:
                     w.writerow([
                         c.name, c.run.source_name, std, model,
                         c.nominal_mass, c.precursor_mz, n,
-                        round(shown, 4), flag, f"{pk.height:.1f}", f"{pk.area:.1f}",
-                        round(start, 4), round(end, 4),
+                        round(shown, 4), flag, fmt_number(pk.index, 4),
+                        "standard" if c.index_scale and c.on_standard_axis else "ladder",
+                        f"{pk.height:.1f}", f"{pk.area:.1f}",
+                        round(start, 4), round(end, 4), fmt_number(pk.fwhm, 5),
+                        pk.manual, pk.window_manual,
                         fmt_number(ratios.get(f"peak{n}_area_fraction")),
                         fmt_number(ratios.get(f"peak{n}_height_fraction")),
                     ])
@@ -697,14 +761,16 @@ def _publish_compound_results(self, out: Path, summary, job: Job):
         with open(run_dir / "peaks.csv", "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["compound", "run", "standard", "transform_model", "peak_no",
-                        "rt_standard_min", "rt_raw_min", "extrapolated",
-                        "height", "area", "window_start_min", "window_end_min"])
+                        "rt_standard_min", "rt_raw_min", "extrapolated", "index",
+                        "height", "area", "window_start_min", "window_end_min",
+                        "peak_by_hand", "window_by_hand"])
             for pk in entry["peaks"]:
                 w.writerow([c.name, c.run.source_name, self.standard["name"],
                             self.transform.model, pk["peak_no"],
                             pk["rt_standard"], pk["rt_raw"], pk["extrapolated"],
-                            f"{pk['height']:.1f}", f"{pk['area']:.1f}",
-                            pk["rt_start"], pk["rt_end"]])
+                            pk["index"], f"{pk['height']:.1f}", f"{pk['area']:.1f}",
+                            pk["rt_start"], pk["rt_end"],
+                            pk["manual"], pk["window_manual"]])
         if str(run_dir) not in seen:
             seen.add(str(run_dir))
             published.append(str(run_dir))

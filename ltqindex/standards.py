@@ -117,6 +117,20 @@ def load_standard(ladder_dir):
     return record
 
 
+
+def index_scale(standard):
+    """The standard ladder as (retention times, indexes), in index order, from the
+    indexes it was saved with as usable. None with fewer than two points."""
+    if not standard:
+        return None
+    usable = {int(i) for i in (standard.get("usable_indexes") or standard["peaks"])}
+    points = sorted((int(i), float(rt)) for i, rt in standard["peaks"].items()
+                    if int(i) in usable)
+    if len(points) < 2:
+        return None
+    return ([rt for _, rt in points], [float(i) for i, _ in points])
+
+
 def list_archive(ladder_dir):
     paths = folders(ladder_dir)
     if not paths["archive_dir"].is_dir():

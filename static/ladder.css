@@ -80,3 +80,39 @@
 @media (max-width:760px){
   .ladder.editing .ladder-body{grid-template-columns:1fr}
 }
+
+/* ------------------------------------------------ compound peak editor */
+.ce-holder{margin-bottom:18px}
+.ce-holder figure.plate{margin-bottom:0}
+.ce-open{display:flex;align-items:center;gap:12px;justify-content:space-between;
+  padding:8px 12px;border:1px solid var(--rule);border-top:0;border-radius:0 0 4px 4px;background:#FBFCFC}
+.ce-open .note{margin:0}
+.ce-holder.ce-editing{border:1px solid var(--accent);border-radius:4px;box-shadow:0 0 0 2px #0E7C8622}
+.ce{display:grid;grid-template-columns:minmax(0,1fr) 270px}
+.ce-main{min-width:0;border-right:1px solid var(--rule-soft)}
+.ce-side{padding:14px 16px;background:#FBFCFC}
+.ce-side h4{font-size:12.5px;color:var(--ink);font-weight:600;margin-bottom:6px}
+.ce-side .note{margin-bottom:12px}
+.ce-row{border:1px solid var(--rule-soft);border-radius:4px;padding:8px 9px;margin-bottom:8px;
+  cursor:pointer;background:#fff}
+.ce-row:hover{border-color:#C9D9DA}
+.ce-row.active{outline:1px solid var(--accent);background:#F1F8F8}
+.ce-row.absent .ce-rt{color:var(--muted);font-style:italic}
+.ce-row-head{display:grid;grid-template-columns:10px auto 12px 1fr 22px 22px;align-items:center;gap:6px;
+  font-size:13px}
+.ce-row-head i{width:9px;height:9px;border-radius:50%;display:inline-block}
+.ce-row-head .mark{color:var(--accent-deep);font-size:10px}
+.ce-rt{font-family:var(--mono);font-size:12.5px;text-align:right}
+.ce-row-body{display:grid;grid-template-columns:52px 1fr;gap:5px 8px;margin-top:8px;font-size:12px;
+  align-items:center}
+.ce-k{color:var(--muted)}
+.ce-win{display:flex;align-items:center;gap:4px}
+.ce-win input{width:74px;padding:3px 5px;font-size:12px;border:1px solid var(--rule);border-radius:3px}
+.ce-reset{border:1px solid var(--rule-soft);background:#fff;border-radius:3px;font-size:11px;
+  padding:0 5px;margin-left:6px;cursor:pointer}
+.ce-reset:hover{border-color:var(--accent);color:var(--accent-deep)}
+.ce-handle{cursor:ew-resize}
+@media (max-width:900px){
+  .ce{grid-template-columns:1fr}
+  .ce-main{border-right:0;border-bottom:1px solid var(--rule-soft)}
+}
