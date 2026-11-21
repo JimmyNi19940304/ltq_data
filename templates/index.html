@@ -144,14 +144,9 @@
     <section class="card fit-card" id="fit-card">
       <h3>Fit onto the standard ladder</h3>
       <p class="note" id="fit-line"></p>
+      <div id="fit-compare"></div>
       <div class="fit-row" id="fit-controls">
-        <label class="field inline"><span>Model</span>
-          <select id="fit-model">
-            <option value="linear">Linear &mdash; ax + b</option>
-            <option value="quadratic">Quadratic &mdash; ax&sup2; + bx + c</option>
-            <option value="cubic" selected>Cubic &mdash; ax&sup3; + bx&sup2; + cx + d</option>
-          </select></label>
-        <button type="button" class="primary" id="run-fit">Fit with the ticked indexes</button>
+        <button type="button" class="primary" id="run-fit">Fit with cubic</button>
         <span class="note" id="fit-status"></span>
       </div>
       <div id="fit-result"></div>

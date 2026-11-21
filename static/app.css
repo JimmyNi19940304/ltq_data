@@ -214,3 +214,14 @@ tr.dim td{color:var(--muted);opacity:.65}
 .tag{background:#E8F3F4;color:var(--accent-deep);border-radius:2px;padding:1px 6px;
   font-size:10.5px;font-weight:500}
 
+/* step 2: the three fits side by side, one row chosen */
+.fit-table.compare tr[data-model]{cursor:pointer}
+.fit-table.compare tr[data-model]:hover td{background:#F3F8F8}
+.fit-table.compare td:first-child{width:28px}
+.fit-table.compare .best{font-weight:700;color:var(--ink)}
+.fit-table.compare td.warn{color:#B4441F;font-weight:600}
+.fit-table.compare tr.chosen td{font-weight:400}
+.fit-table.compare tr.chosen td:nth-child(2){font-weight:600}
+.fit-equation{font-size:12.5px;margin:8px 0 4px;overflow-wrap:anywhere}
+.tag.used{background:#12242E;color:#fff}
+.fit-error{color:#7A2F14}

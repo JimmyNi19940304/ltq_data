@@ -343,6 +343,17 @@ def fit(sid):
     return jsonify(session.ladder_page())
 
 
+@app.post("/api/session/<sid>/fit/compare")
+def fit_compare(sid):
+    """All three models' statistics for the ticked indexes: {"indexes": [...]}."""
+    session = get_session(sid)
+    _ladder_ready(session)
+    payload = request.get_json(silent=True) or {}
+    if session.standard is None:
+        return jsonify({"error": session.transform_error or "No standard ladder to fit onto."}), 400
+    return jsonify(session.compare_fits(payload.get("indexes") or []))
+
+
 @app.post("/api/session/<sid>/compounds")
 def compounds(sid):
     """Read the compounds and put them through the approved fit."""

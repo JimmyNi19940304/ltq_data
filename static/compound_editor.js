@@ -20,7 +20,7 @@
    opts: trace() -> Promise of the trace JSON; save(body) -> Promise of the reply;
          close(reply|null) puts the figure back; alert(title, items). */
 
-const CE_COLORS = { 1: "#0B5D6E", 2: "#C6532C" };
+const CE_COLORS = { 1: "#6A3D9A", 2: "#B4441F" };   // as PEAK_COLORS in plotting.py
 let CE_OPEN = null;           // compound number being edited; one at a time
 
 function compoundEditorOpen() { return CE_OPEN; }

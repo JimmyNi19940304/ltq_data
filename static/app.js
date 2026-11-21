@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 const state = {
   session: null, compounds: 0, summary: null, spectra: [], standard: null,
   reached: 1,          // highest step whose content exists
+  model: "cubic",      // the fit model chosen on step 2
   spectraFresh: false, // false once the chromatograms are replotted
   exportFresh: false,
 };
@@ -300,7 +301,8 @@ function showLadderPage(d, message) {
   slot.innerHTML = "";
   slot.appendChild(mainLadderCard(l));
   if (message) slot.querySelector("[data-role=rt-max-status]").textContent = message;
-  if (d.model) $("fit-model").value = d.model;
+  if (d.model) state.model = d.model;
+  renderComparison(d.comparison);
   renderFit(d);
   showAlert("Worth checking", l.warnings || []);
   paintRail(2);
@@ -349,9 +351,12 @@ function mainLadderCard(l) {
   const present = Object.keys(l.peaks).map(Number).sort((a, b) => a - b);
   const list = card.querySelector("[data-role=list]");
   const exact = new Set((l.exact || []).map(Number));
+  let built = false;
   const count = () => {
     card.querySelector("[data-role=count]").textContent =
       `${state.selected.length} of ${present.length} indexes ticked`;
+    // new ticks: the three fits are worked out again for them
+    if (built) scheduleComparison();
     fitStale();
   };
   const paint = () => {
@@ -384,6 +389,7 @@ function mainLadderCard(l) {
   card.querySelector("[data-role=all]").onclick = () => { state.selected = [...allowed]; paint(); };
   card.querySelector("[data-role=none]").onclick = () => { state.selected = []; paint(); };
   paint();
+  built = true;
 
   card.querySelector("[data-role=rt-max]").onsubmit = (ev) => {
     ev.preventDefault();
@@ -428,12 +434,85 @@ function fitStale() {
   const fit = d.fit;
   const current = fit && sameSet(fit.transform.indexes.map(Number),
     state.selected.filter(i => d.standard.usable_indexes.includes(i)))
-    && fit.model === $("fit-model").value;
+    && fit.model === state.model;
   go.disabled = !current;
   $("fit-status").textContent = fit && !current
     ? "Ticks or model changed since this fit — fit again to continue." : "";
 }
-$("fit-model").onchange = fitStale;
+
+const MODEL_NAMES = { linear: "Linear", quadratic: "Quadratic", cubic: "Cubic" };
+const modelName = (key) => MODEL_NAMES[key] || key;
+
+/* The three models side by side for the ticked indexes, worked out before any
+   is chosen. Click a row to choose; the button below fits with it. */
+function renderComparison(c) {
+  const box = $("fit-compare");
+  state.comparison = c;
+  $("run-fit").textContent = `Fit with ${modelName(state.model).toLowerCase()}`;
+  if (!c) { box.innerHTML = ""; return; }
+  if (c.error || !c.models.length) {
+    box.innerHTML = `<p class="note fit-error">${escapeHtml(c.error || "Nothing could be fitted.")}</p>`;
+    $("run-fit").disabled = true;
+    return;
+  }
+  $("run-fit").disabled = !c.models.some(m => m.key === state.model);
+  const fit = state.ladderPage && state.ladderPage.fit;
+  const inUse = fit && sameSet(fit.transform.indexes.map(Number), c.indexes) ? fit.model : null;
+  const best = (k) => Math.min(...c.models.map(m => m[k] ?? Infinity));
+  const num = (v, k, digits) => v === null || v === undefined ? "—"
+    : `<span class="${c.models.length > 1 && v === best(k) ? "best" : ""}">${v.toFixed(digits)}</span>`;
+  const rows = c.models.map(m => `
+    <tr data-model="${m.key}" class="${m.key === state.model ? "chosen" : ""}">
+      <td><input type="radio" name="fit-choice" ${m.key === state.model ? "checked" : ""}
+        aria-label="${modelName(m.key)}"></td>
+      <td>${modelName(m.key)}${m.key === c.suggested ? ' <span class="tag">suggested</span>' : ""}${m.key === inUse ? ' <span class="tag used">in use</span>' : ""}</td>
+      <td class="mono">${num(m.rmse, "rmse", 4)}</td>
+      <td class="mono">${num(m.std_error, "std_error", 4)}</td>
+      <td class="mono">${num(m.max_abs_residual, "max_abs_residual", 4)}</td>
+      <td class="mono">${m.r2.toFixed(6)}</td>
+      <td class="mono">${m.adjusted_r2 === null || m.adjusted_r2 === undefined ? "—" : m.adjusted_r2.toFixed(6)}</td>
+      <td class="${m.turns_at === null ? "" : "warn"}">${m.turns_at === null ? "no" : `yes, at ${m.turns_at} min`}</td>
+    </tr>`).join("");
+  const chosen = c.models.find(m => m.key === state.model);
+  const notes = [];
+  if (c.excluded_by_standard.length) {
+    notes.push(`Index ${c.excluded_by_standard.join(", ")} ticked but not usable in the standard, so left out.`);
+  }
+  if (c.uncalibrated) notes.push(`With no fit at all, RMSE ${c.uncalibrated.rmse.toFixed(4)} min.`);
+  notes.push(`"Suggested" is the simplest model no other beats by more than 5% on standard error.
+    Lowest value in each column in bold. "Turns over" means the curve stops rising inside
+    this run, which would put later times out of order.`);
+  box.innerHTML = `
+    <div class="table-wrap"><table class="fit-table compare">
+      <caption>All three models on ${c.indexes.length} indexes (${c.indexes.join(", ")}). Choose one.</caption>
+      <thead><tr><th></th><th>Model</th><th>RMSE (min)</th><th>Std. error</th>
+      <th>Largest residual</th><th>R²</th><th>Adjusted R²</th><th>Turns over</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    ${chosen ? `<p class="fit-equation"><b>${modelName(chosen.key)}:</b>
+      <span class="mono">${escapeHtml(chosen.equation)}</span></p>` : ""}
+    <p class="note">${notes.join(" ")}</p>`;
+  for (const tr of box.querySelectorAll("tr[data-model]")) {
+    tr.onclick = () => {
+      state.model = tr.dataset.model;
+      renderComparison(state.comparison);
+      fitStale();
+    };
+  }
+}
+
+let compareTimer = null;
+function scheduleComparison() {
+  clearTimeout(compareTimer);
+  compareTimer = setTimeout(() => {
+    if (!state.ladderPage || !state.ladderPage.standard) return;
+    const asked = state.selected.slice();
+    postJson("/fit/compare", { indexes: asked }).then(c => {
+      if (!sameSet(asked, state.selected)) return;     // ticks moved on meanwhile
+      if (c.error && !c.models) throw new Error(c.error);
+      renderComparison(c);
+    }).catch(e => showAlert("Could not compare the fits", [e.message]));
+  }, 250);
+}
 
 function renderFit(d) {
   const box = $("fit-result");
@@ -448,22 +527,14 @@ function renderFit(d) {
   $("fit-controls").classList.remove("hidden");
   $("fit-line").innerHTML = `x = this run's ladder retention time, y = the same index on
     <b>${escapeHtml(d.standard.name)}</b>. Only ticked indexes that are usable in the standard
-    take part.`;
+    take part. The three models below are already worked out for the ticked indexes and
+    update as you tick.`;
   const f = d.fit;
   if (!f) {
-    box.innerHTML = `<p class="note">Not fitted yet.</p>`;
+    box.innerHTML = `<p class="note">Choose a model in the table, then fit to see its plot.</p>`;
     fitStale();
     return;
   }
-  const rows = f.models.map(m => `
-    <tr class="${m.key === f.model ? "chosen" : ""}">
-      <td>${({ linear: "Linear", quadratic: "Quadratic", cubic: "Cubic" })[m.key] || escapeHtml(m.key)}${m.key === f.suggested ? ' <span class="tag">suggested</span>' : ""}</td>
-      <td class="mono">${escapeHtml(m.equation)}</td>
-      <td class="mono">${m.rmse.toFixed(4)}</td>
-      <td class="mono">${m.std_error === null ? "—" : m.std_error.toFixed(4)}</td>
-      <td class="mono">${m.max_abs_residual.toFixed(4)}</td>
-      <td class="mono">${m.r2.toFixed(6)}</td>
-    </tr>`).join("");
   const notes = [];
   if (f.monotonic && !f.monotonic.monotonic) {
     notes.push(`The ${f.model} curve turns over at ${f.monotonic.turns_at} min, so later
@@ -476,13 +547,7 @@ function renderFit(d) {
     <figure class="plate fit-plate"><img src="${api("/figure/" + encodeURIComponent(f.figure))}?t=${Date.now()}"
       alt="Ladder fit"><figcaption><b>${escapeHtml(f.transform.model)} fit over
       ${f.transform.n_indexes} indexes</b><span>${f.transform.indexes.join(", ")}</span></figcaption></figure>
-    ${notes.length ? `<ul class="card-warnings fit-notes">${notes.map(n => `<li>${n}</li>`).join("")}</ul>` : ""}
-    <div class="table-wrap"><table class="fit-table">
-      <caption>Every model on the same indexes; the highlighted one is used</caption>
-      <thead><tr><th>Model</th><th>Equation</th><th>RMSE (min)</th><th>Std. error</th>
-      <th>Largest residual</th><th>R²</th></tr></thead><tbody>${rows}</tbody></table></div>
-    ${f.uncalibrated ? `<p class="note">Before any fit, RMSE ${f.uncalibrated.rmse.toFixed(4)} min.
-      "Suggested" is the simplest model that nothing beats by more than 5% on standard error.</p>` : ""}`;
+    ${notes.length ? `<ul class="card-warnings fit-notes">${notes.map(n => `<li>${n}</li>`).join("")}</ul>` : ""}`;
   box.querySelector("img").onclick = () => {
     $("lightbox-img").src = box.querySelector("img").src;
     $("lightbox").classList.remove("hidden");
@@ -494,7 +559,7 @@ $("run-fit").onclick = () => {
   const button = $("run-fit");
   button.disabled = true;
   $("fit-status").textContent = "Fitting…";
-  postJson("/fit", { model: $("fit-model").value, indexes: state.selected }).then(d => {
+  postJson("/fit", { model: state.model, indexes: state.selected }).then(d => {
     button.disabled = false;
     if (d.error) throw new Error(d.error);
     showLadderPage(d);

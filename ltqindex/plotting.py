@@ -3,6 +3,8 @@ the exported files, so what you approve is what you download."""
 
 from __future__ import annotations
 
+import warnings
+
 import math
 from pathlib import Path
 
@@ -147,28 +149,51 @@ def plot_ladder(ladder, run_name, path=None, formats=("png",)):
     return written
 
 
+# peak 1 and peak 2 keep these colours in the figure and in the browser editor
+PEAK_COLORS = {1: "#6A3D9A", 2: MARK}
+
+
+def _zoom_range(compound):
+    """The stretch of the axis around both peaks and their windows."""
+    spans = [compound.axis_peak(pk) for pk in compound.peaks]
+    lo = min(min(s) for s in spans)
+    hi = max(max(s) for s in spans)
+    pad = max((hi - lo) * 0.6, 0.4)
+    rt = compound.axis_rt
+    return max(float(rt[0]), lo - pad), min(float(rt[-1]), hi + pad)
+
+
 def plot_compound(compound, path=None, formats=("png",)):
-    fig, ax = plt.subplots(figsize=(11, 4.6))
+    """The whole MS2 chromatogram on top, and below it a close-up of the two
+    peaks with their spectrum windows, where a moved peak or window shows."""
+    has_peaks = bool(compound.peaks)
+    if has_peaks:
+        fig, (ax, zx) = plt.subplots(2, 1, figsize=(11, 7.8),
+                                     gridspec_kw={"height_ratios": [1, 1.25], "hspace": 0.42})
+    else:
+        fig, ax = plt.subplots(figsize=(11, 4.6))
+        zx = None
     rt, tic = compound.axis_rt, compound.tic
     top = float(tic.max()) or 1.0
     scale, unit = intensity_scale(top)
     standard = compound.on_standard_axis
+    xlabel = (f"Retention time on the {compound.transform.standard_name} axis (min)"
+              if standard else "Retention time (min)")
 
+    # ---------------------------------------------------------- whole run
     ax.fill_between(rt, tic / scale, color=COMPOUND, alpha=0.10, zorder=2)
     ax.plot(rt, tic / scale, lw=1.1, color=COMPOUND, zorder=3)
-
     for pk in compound.peaks:
         apex, start, end = compound.axis_peak(pk)
-        y = pk.height / scale
-        ax.axvspan(start, end, color=MARK, alpha=0.14, zorder=1,
-                   hatch="////" if pk.window_manual else None, ec=MARK if pk.window_manual else None,
-                   lw=0)
-        ax.plot([apex], [y], marker="D" if pk.manual else "v", ms=4.5 if pk.manual else 4,
-                color=MARK, zorder=4)
-        ax.annotate(compound.peak_label(pk),
-                    xy=(apex, y), xytext=(0, 9), textcoords="offset points",
-                    ha="center", fontsize=8.5, color=MARK, fontweight="600",
-                    linespacing=1.35, zorder=5)
+        c = PEAK_COLORS.get(pk.slot, MARK)
+        ax.axvspan(start, end, color=c, alpha=0.25, zorder=1, lw=0)
+        ax.plot([apex], [pk.height / scale], marker="D" if pk.manual else "v",
+                ms=4.5 if pk.manual else 4, color=c, zorder=4)
+    if has_peaks:
+        a, b = _zoom_range(compound)
+        ax.axvspan(a, b, color=HAIRLINE, alpha=0.35, zorder=0, lw=0)
+        ax.text((a + b) / 2, top / scale * 1.3, "close-up below", ha="center", va="top",
+                fontsize=7.5, color=MUTED)
 
     precursor = f"{compound.precursor_mz:g}" if compound.precursor_mz else "unknown"
     subtitle = f"MS2 of precursor m/z {precursor}"
@@ -188,26 +213,72 @@ def plot_compound(compound, path=None, formats=("png",)):
             subtitle += "   |   * extrapolated beyond the ladder"
     if compound.params.rt_max and compound.params.rt_max > 0:
         subtitle += f"   |   scans after {compound.params.rt_max:g} min ignored"
-    notes = [f"windows {compound.params.window_fwhm:g} x FWHM"]
-    if standard and compound.index_scale:
-        notes.append("index from the standard ladder")
-    if any(p.manual for p in compound.peaks):
-        notes.append("◆ placed by hand")
-    if any(p.window_manual for p in compound.peaks):
-        notes.append("hatched window set by hand")
-    if compound.absent:
-        notes.append("no peak " + ", ".join(map(str, compound.absent)))
-    # inside the axes, top right: the subtitle above has room for one line only
-    ax.text(0.995, 0.97, "   |   ".join(notes), transform=ax.transAxes,
-            fontsize=7.5, color=MUTED, ha="right", va="top")
 
-    ax.set_xlabel(f"Retention time on the {compound.transform.standard_name} axis (min)"
-                  if standard else "Retention time (min)")
-    ax.set_ylabel("MS2 total ion current" + unit)
-    ax.set_ylim(0, top / scale * 1.45)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("MS2 TIC" + unit)
+    ax.set_ylim(0, top / scale * 1.35)
     ax.set_xlim(rt[0], rt[-1])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
     _header(ax, f"Chromatogram of {compound.name}", subtitle)
-    written = _finish(fig, ax, path, formats)
+
+    # ----------------------------------------------------------- close-up
+    if zx is not None:
+        a, b = _zoom_range(compound)
+        inside = (rt >= a) & (rt <= b)
+        ztop = float(tic[inside].max()) if inside.any() else top
+        zscale, zunit = intensity_scale(ztop)
+        zx.fill_between(rt[inside], tic[inside] / zscale, color=COMPOUND, alpha=0.10, zorder=2)
+        zx.plot(rt[inside], tic[inside] / zscale, lw=1.2, color=COMPOUND, zorder=3,
+                marker="o", ms=1.6)
+        apexes = [compound.axis_peak(pk)[0] for pk in compound.peaks]
+        # two tops close together: their labels lean apart instead of stacking
+        close = len(apexes) == 2 and abs(apexes[1] - apexes[0]) < 0.18 * (b - a)
+        for row, pk in enumerate(compound.peaks):
+            apex, start, end = compound.axis_peak(pk)
+            c = PEAK_COLORS.get(pk.slot, MARK)
+            y = pk.height / zscale
+            lean = (-1 if apex <= min(apexes) else 1) if close else 0
+            zx.axvspan(start, end, color=c, alpha=0.13, zorder=1, lw=0,
+                       hatch="////" if pk.window_manual else None,
+                       ec=c if pk.window_manual else None)
+            for edge in (start, end):
+                zx.axvline(edge, color=c, lw=1, ls="-" if pk.window_manual else "--", zorder=1)
+            zx.plot([apex], [y], marker="D" if pk.manual else "v", ms=6 if pk.manual else 5,
+                    color=c, zorder=5)
+            zx.annotate(f"peak {pk.slot}\n" + compound.peak_label(pk),
+                        xy=(apex, y), xytext=(14 * lean, 10), textcoords="offset points",
+                        ha={-1: "right", 0: "center", 1: "left"}[lean], va="bottom",
+                        fontsize=8.5, color=c, fontweight="600",
+                        linespacing=1.3, zorder=6)
+            # one row per window, so overlapping windows keep readable times
+            zx.text((start + end) / 2, 0.985 - 0.065 * row,
+                    f"window {pk.slot}: {start:.2f}–{end:.2f}",
+                    transform=zx.get_xaxis_transform(), ha="center", va="top",
+                    fontsize=7.5, color=c, fontweight="600")
+
+        notes = [f"windows {compound.params.window_fwhm:g} x FWHM unless set by hand"]
+        if standard and compound.index_scale:
+            notes.append("index from the standard ladder")
+        if any(p.manual for p in compound.peaks):
+            notes.append("◆ peak placed by hand")
+        if any(p.window_manual for p in compound.peaks):
+            notes.append("hatched, solid edges: window set by hand")
+        if compound.absent:
+            notes.append("no peak " + ", ".join(map(str, compound.absent)))
+        zx.set_title("Close-up: the peaks and the windows their spectra are summed over",
+                     loc="left", fontsize=9.5, fontweight="600", pad=18)
+        zx.text(0.0, 1.015, "   |   ".join(notes), transform=zx.transAxes,
+                fontsize=7.5, color=MUTED, va="bottom", ha="left")
+        zx.set_xlim(a, b)
+        zx.set_ylim(0, ztop / zscale * 1.6)
+        zx.set_xlabel(xlabel)
+        zx.set_ylabel("MS2 TIC" + zunit)
+    target = zx if zx is not None else ax
+    with warnings.catch_warnings():
+        # tight_layout is fine with the two stacked axes; it only warns about the ratio
+        warnings.simplefilter("ignore", UserWarning)
+        written = _finish(fig, target, path, formats)
     plt.close(fig)
     return written
 

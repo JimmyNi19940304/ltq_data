@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 from .analysis import Compound, Params, analyse_ladder, DEFAULT_LADDER_MASSES
 from .calibration import calibrate
 from .compoundedit import load_overrides as load_compound_edits, parse_edits, store_edits
@@ -258,7 +260,42 @@ class Session:
             } if std else None),
             "standard_error": self.transform_error if not std else None,
             "model": self.transform_model,
+            "comparison": self.compare_fits(selected) if std else None,
             "fit": self.fit_payload(),
+        }
+
+    def compare_fits(self, indexes):
+        """Linear, quadratic and cubic fits of this ladder onto the standard with
+        the given indexes, worked out up front so the operator can choose one.
+        Nothing is kept: choosing is fit_ladder's job."""
+        if self.standard is None or self.ladder_entry is None:
+            return None
+        local = {int(k): float(v) for k, v in self.ladder_entry["peaks"].items()}
+        std_peaks = {int(k): float(v) for k, v in self.standard["peaks"].items()}
+        usable = {int(i) for i in (self.standard.get("usable_indexes") or std_peaks)}
+        selected = {int(i) for i in indexes} & set(local)
+        chosen = sorted(selected & usable & set(std_peaks))
+        fit = calibrate(std_peaks, local, indexes=chosen)
+        rt = self.ladder.traces[0]["rt"]
+        grid = np.linspace(float(rt[0]), float(rt[-1]), 2000)
+        models = []
+        for m in fit.get("models", []):
+            falling = np.diff(np.polyval(m["coefficients"], grid)) <= 0
+            models.append({
+                **{k: m[k] for k in ("key", "label", "equation", "rmse", "std_error",
+                                     "max_abs_residual", "mean_abs_residual", "r2",
+                                     "adjusted_r2", "exact", "n_params")},
+                # a curve that turns over inside the run would reorder the times
+                "turns_at": (round(float(grid[int(np.argmax(falling))]), 3)
+                             if falling.any() else None),
+            })
+        return {
+            "indexes": chosen,
+            "excluded_by_standard": sorted(selected - usable),
+            "models": models,
+            "suggested": fit.get("best"),
+            "uncalibrated": fit.get("uncalibrated"),
+            "error": fit.get("error"),
         }
 
     def fit_ladder(self, model, indexes):
